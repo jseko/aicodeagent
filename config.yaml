@@ -1,0 +1,39 @@
+theme: dark
+openai:
+  model: deepseek-v4-pro
+  temperature: 0.7
+skills_paths:
+  - ./skills
+log_level: info
+
+agent:
+  large_model:
+    provider: deepseek
+    model: deepseek-v4-pro
+  small_model:
+    provider: deepseek
+    model: deepseek-v4-pro
+
+providers:
+  - type: openai
+    name: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: sk-62a2a88831a9477d9d113f75b8cde9cd
+
+session:
+  idle_timeout: 30m
+  max_sessions: 10
+
+permission:
+  default_level: 1
+  file_whitelist:
+    - "/tmp/"
+    - "./"
+  cmd_whitelist:
+    - "go build"
+    - "go test"
+    - "go vet"
+    - "ls"
+    - "cat"
+
+summary_prompt: "请用简洁的语言总结以下对话的关键要点，保留所有技术细节。"
