@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"AICodeAgent/internal/config"
+	"AICodeAgent/internal/events"
 	"AICodeAgent/internal/llm"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/agent/tools"
+	"AICodeAgent/internal/pubsub"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -30,6 +32,8 @@ type Coordinator interface {
 	Summarize(ctx context.Context, sessionID string) error
 	Model() *Model
 	UpdateModels(ctx context.Context) error
+	HandleUserMessage(msg events.UserMessage)
+	PublishToolResult(result events.ToolResult)
 }
 
 // coordinator Coordinator接口实现
@@ -45,6 +49,7 @@ type coordinator struct {
 	running      map[string]context.CancelFunc
 	mu           sync.RWMutex
 	permService  *permission.PermissionService
+	broker       pubsub.Publisher[events.Event]
 }
 
 // MessageService 消息持久化服务接口
@@ -76,13 +81,15 @@ type FunctionCall struct {
 
 // NewCoordinator 创建Coordinator实例
 func NewCoordinator(cfg *config.Config, sessions SessionService, messages MessageService,
-	toolRegistry *tools.ToolRegistry, permService *permission.PermissionService) Coordinator {
+	toolRegistry *tools.ToolRegistry, permService *permission.PermissionService,
+	broker pubsub.Publisher[events.Event]) Coordinator {
 	c := &coordinator{
 		config:      cfg,
 		sessions:    sessions,
 		messages:    messages,
 		tools:       toolRegistry,
 		permService: permService,
+		broker:      broker,
 		running:     make(map[string]context.CancelFunc),
 	}
 	c.toolCaller = tools.NewToolCaller(toolRegistry, permService)
@@ -274,6 +281,85 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		Complexity:  complexity,
 	}
 	return c.currentAgent.Run(runCtx, call)
+}
+
+// HandleUserMessage 事件驱动处理用户消息（由外部事件循环调用）
+func (c *coordinator) HandleUserMessage(msg events.UserMessage) {
+	// 预注册 cancel 占位符，防止同一会话的竞态重复处理
+	c.mu.Lock()
+	if _, busy := c.running[msg.SessionID]; busy {
+		c.mu.Unlock()
+		log.Printf("[Coordinator] 会话 %s 正在处理中，跳过重复消息", msg.SessionID)
+		return
+	}
+	c.running[msg.SessionID] = func() {} // 占位，Run() 将替换为实际 cancel
+	c.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		result, err := c.Run(ctx, msg.SessionID, msg.Content)
+		if err != nil {
+			c.broker.PublishMustDeliver(ctx,
+				events.ErrorEvent{SessionID: msg.SessionID, Error: err.Error(), Time: time.Now()})
+			return
+		}
+
+		if result.Error != nil {
+			c.broker.PublishMustDeliver(ctx,
+				events.ErrorEvent{SessionID: msg.SessionID, Error: result.Error.Error(), Time: time.Now()})
+			return
+		}
+
+		if result.Stream != nil {
+			c.consumeStream(ctx, msg.SessionID, result.Stream)
+		}
+
+		c.broker.PublishMustDeliver(ctx,
+			events.AgentThink{SessionID: msg.SessionID, IsDone: true, Time: time.Now()})
+	}()
+}
+
+// consumeStream 消费 LLM 流式响应，发布 AgentThink 和 ToolCall 事件
+func (c *coordinator) consumeStream(ctx context.Context, sessionID string, stream <-chan llm.StreamingChunk) {
+	for chunk := range stream {
+		if chunk.Error != nil {
+			c.broker.PublishMustDeliver(ctx,
+				events.ErrorEvent{SessionID: sessionID, Error: chunk.Error.Error(), Time: time.Now()})
+			return
+		}
+		if chunk.Done {
+			break
+		}
+
+		if toolCall := c.detectToolCall(chunk); toolCall != nil {
+			c.broker.PublishMustDeliver(ctx, *toolCall)
+			continue
+		}
+
+		c.broker.Publish(events.AgentThink{
+			SessionID: sessionID,
+			Content:   chunk.Content,
+			Time:      time.Now(),
+		})
+	}
+}
+
+// detectToolCall 检测 LLM chunk 中的工具调用意图
+// 当前返回 nil，待 LLM Provider 支持 function calling 后实现
+func (c *coordinator) detectToolCall(chunk llm.StreamingChunk) *events.ToolCall {
+	_ = chunk
+	// TODO: 当 LLM Provider 支持 function calling 时，解析 chunk 中的
+	// tool_calls 字段并返回 events.ToolCall{SessionID, ToolName, Params, Time}
+	return nil
+}
+
+// PublishToolResult 发布工具执行结果（由工具执行层调用）
+func (c *coordinator) PublishToolResult(result events.ToolResult) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.broker.PublishMustDeliver(ctx, result)
 }
 
 // Cancel 取消指定会话

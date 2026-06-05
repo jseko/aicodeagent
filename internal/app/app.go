@@ -10,7 +10,9 @@ import (
 	"AICodeAgent/internal/agent"
 	"AICodeAgent/internal/agent/tools"
 	"AICodeAgent/internal/config"
+	"AICodeAgent/internal/events"
 	"AICodeAgent/internal/permission"
+	"AICodeAgent/internal/pubsub"
 )
 
 // App 依赖注入容器，管理所有共享组件
@@ -24,6 +26,7 @@ type App struct {
 	SessionService agent.SessionService
 	ToolRegistry   *tools.ToolRegistry
 	PermService    *permission.PermissionService
+	Broker         *pubsub.Broker[events.Event]
 }
 
 // New 创建 App 实例并初始化所有组件
@@ -62,6 +65,9 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		cfg.Permission.CmdWhitelist,
 	)
 
+	// 初始化事件总线
+	broker := pubsub.NewBroker[events.Event]()
+
 	// 初始化Coordinator
 	coordinator := agent.NewCoordinator(
 		cfg,
@@ -69,6 +75,7 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		messageService,
 		toolRegistry,
 		permService,
+		broker,
 	)
 
 	app := &App{
@@ -80,6 +87,7 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		SessionService: sessionService,
 		ToolRegistry:   toolRegistry,
 		PermService:    permService,
+		Broker:         broker,
 	}
 
 	logger.Info("App初始化完成")
@@ -91,8 +99,33 @@ func (a *App) Close() {
 	if a.Coordinator != nil {
 		a.Coordinator.CancelAll()
 	}
+	if a.Broker != nil {
+		a.Broker.Shutdown()
+	}
 	a.Cancel()
 	a.Logger.Info("程序已优雅关闭")
+}
+
+// StartEventLoop 启动事件循环：订阅 Broker，将 UserMessage 分发给 Coordinator
+func (a *App) StartEventLoop(ctx context.Context) {
+	ch := a.Broker.Subscribe(ctx)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-ch:
+				if !ok {
+					return
+				}
+				switch e := event.(type) {
+				case events.UserMessage:
+					a.Coordinator.HandleUserMessage(e)
+				}
+			}
+		}
+	}()
 }
 
 // registerDefaultTools 注册默认工具

@@ -1,22 +1,28 @@
 package tui
 
 import (
+	"context"
 	"strings"
 
 	"AICodeAgent/internal/app"
+	"AICodeAgent/internal/events"
+	"AICodeAgent/internal/pubsub"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
 // Model 存储TUI所有状态
 type Model struct {
-	app       *app.App
-	messages  []string // 消息历史
-	input     string   // 当前输入
-	cursor    int      // 光标位置
-	ready     bool     // 是否初始化完成
-	isLoading bool     // 是否正在等待LLM响应
-	statusMsg string   // 状态提示信息
+	app        *app.App
+	pub        pubsub.Publisher[events.Event]
+	sub        pubsub.Subscriber[events.Event]
+	sessionID  string
+	messages   []string
+	input      string
+	cursor     int
+	ready      bool
+	isLoading  bool
+	statusMsg  string
 }
 
 // 消息样式
@@ -27,6 +33,9 @@ var msgStyle = lipgloss.NewStyle().
 func New(a *app.App) Model {
 	return Model{
 		app:       a,
+		pub:       a.Broker,
+		sub:       a.Broker,
+		sessionID: "default",
 		messages:  []string{},
 		input:     "",
 		ready:     false,
@@ -47,7 +56,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// 加载中时不处理其他按键
 		if m.isLoading {
 			return m, nil
 		}
@@ -57,14 +65,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			if m.input != "" {
-				// 发送消息并清空输入
 				m.messages = append(m.messages, "You: "+m.input)
-				prompt := m.input
-				m.input = ""
 				m.isLoading = true
 				m.statusMsg = "正在思考..."
-				// 返回tea.Cmd，异步执行LLM调用
-				return m, callLLM(prompt)
+				m.pub.Publish(events.UserMessage{
+					SessionID: m.sessionID,
+					Content:   m.input,
+				})
+				m.input = ""
+				return m, nil
 			}
 			return m, nil
 		default:
@@ -72,14 +81,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case LLMResponseMsg:
-		// 异步操作完成后更新UI
-		m.isLoading = false
-		if msg.Err != nil {
-			m.statusMsg = "错误: " + msg.Err.Error()
-		} else {
-			m.messages = append(m.messages, "AI: "+msg.Content)
+	case events.AgentThink:
+		if msg.IsDone {
+			m.isLoading = false
 			m.statusMsg = "完成"
+			return m, nil
+		}
+		m.appendStreamContent(msg.Content)
+		m.isLoading = true
+		return m, nil
+
+	case events.ErrorEvent:
+		m.isLoading = false
+		m.statusMsg = "错误: " + msg.Error
+		return m, nil
+
+	case events.ToolCall:
+		m.messages = append(m.messages, "[tool] "+msg.ToolName)
+		m.statusMsg = "执行: " + msg.ToolName
+		return m, nil
+
+	case events.ToolResult:
+		if msg.Error != "" {
+			m.messages = append(m.messages, "[tool error] "+msg.Error)
+			m.statusMsg = "工具错误: " + msg.Error
+		} else {
+			m.statusMsg = "工具完成: " + msg.ToolName
 		}
 		return m, nil
 	}
@@ -95,12 +122,15 @@ func (m Model) View() string {
 
 	var b strings.Builder
 
-	// 渲染消息历史
-	for _, msg := range m.messages {
+	// 长会话性能优化：仅渲染最近 500 条消息
+	start := 0
+	if len(m.messages) > 500 {
+		start = len(m.messages) - 500
+	}
+	for _, msg := range m.messages[start:] {
 		b.WriteString(msgStyle.Render(msg) + "\n")
 	}
 
-	// 根据状态渲染输入区
 	if m.isLoading {
 		b.WriteString("\n[思考中] " + m.statusMsg + "\n")
 		b.WriteString("请稍候...")
@@ -111,9 +141,45 @@ func (m Model) View() string {
 	return b.String()
 }
 
+func (m *Model) appendStreamContent(content string) {
+	if len(m.messages) == 0 || !strings.HasPrefix(m.messages[len(m.messages)-1], "AI: ") {
+		m.messages = append(m.messages, "AI: "+content)
+	} else {
+		m.messages[len(m.messages)-1] += content
+	}
+}
+
+// ListenEvents 在独立 goroutine 中订阅事件，转换为 tea.Msg
+func (m *Model) ListenEvents(ctx context.Context, program *tea.Program) {
+	ch := m.sub.Subscribe(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			program.Send(event)
+		}
+	}
+}
+
 // Start 启动 TUI 循环
 func Start(a *app.App) error {
-	p := tea.NewProgram(New(a))
+	m := New(a)
+	p := tea.NewProgram(m)
+
+	ctx, cancel := context.WithCancel(a.Ctx)
+	defer cancel()
+
+	// 启动 App 层事件循环（Coordinator ← Broker）
+	a.StartEventLoop(ctx)
+
+	// 启动 TUI 事件监听（Broker → tea.Msg）
+	go m.ListenEvents(ctx, p)
+
 	_, err := p.Run()
 	return err
 }
