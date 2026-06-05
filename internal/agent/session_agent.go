@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync/atomic"
 
 	"AICodeAgent/internal/llm"
@@ -85,7 +86,7 @@ func estimateComplexity(prompt string, historyLen int) float64 {
 	return score
 }
 
-// Run 执行会话代理调用（流式输出）
+// Run 执行会话代理调用（收集完整响应，含工具调用）
 func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentResult, error) {
 	// 1. 根据复杂度选择模型
 	complexity := call.Complexity
@@ -102,35 +103,50 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 	if err != nil {
 		return nil, fmt.Errorf("build provider: %w", err)
 	}
+	defer provider.Close()
 
-	// 3. 选择对应模型类型的系统提示词
-	prompt := a.systemPrompt
-	if model == a.smallModel.Load() {
-		prompt = a.smallSystemPrompt
-	}
-
-	// 4. 构建消息
-	messages := a.buildMessages(prompt, call)
-
-	// 5. 流式调用LLM
+	// 3. 流式调用LLM（带工具定义）
 	streamCall := llm.AgentStreamCall{
 		Prompt:      call.Prompt,
-		Messages:    messages,
+		Messages:    call.Messages,
+		Tools:       call.Tools,
 		Temperature: a.temperature,
 	}
+	log.Printf("[SessionAgent] 调用LLM（工具数=%d, 历史消息数=%d）", len(call.Tools), len(call.Messages))
 	ch, err := provider.Stream(ctx, streamCall)
 	if err != nil {
-		provider.Close()
+		log.Printf("[SessionAgent] LLM调用失败: %v", err)
 		return &AgentResult{Session: call.Session, Error: err}, err
 	}
 
-	// 6. 返回流式通道，Provider在readSSE完成后自动关闭
-	result := &AgentResult{
-		Session: call.Session,
-		Stream:  ch,
+	// 4. 收集所有chunk：文本内容 + 工具调用
+	var fullText string
+	var toolCalls []llm.ToolCallDelta
+	for chunk := range ch {
+		if chunk.Error != nil {
+			log.Printf("[SessionAgent] 流错误: %v", chunk.Error)
+			return &AgentResult{Session: call.Session, Error: chunk.Error}, chunk.Error
+		}
+		if chunk.Done {
+			break
+		}
+		if len(chunk.ToolCalls) > 0 {
+			toolCalls = chunk.ToolCalls
+			log.Printf("[SessionAgent] 检测到工具调用: %d个", len(toolCalls))
+		}
+		if chunk.Content != "" {
+			fullText += chunk.Content
+		}
 	}
 
-	return result, nil
+	log.Printf("[SessionAgent] LLM响应完成（文本=%d字符, 工具调用=%d个）", len(fullText), len(toolCalls))
+
+	// 5. 返回收集到的完整响应
+	return &AgentResult{
+		Session:   call.Session,
+		Response:  fullText,
+		ToolCalls: toolCalls,
+	}, nil
 }
 
 // buildProvider 根据模型配置构建对应的Provider实例

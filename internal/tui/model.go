@@ -82,13 +82,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case events.AgentThink:
+		if msg.Content != "" {
+			m.appendStreamContent(msg.Content)
+		}
 		if msg.IsDone {
 			m.isLoading = false
 			m.statusMsg = "完成"
-			return m, nil
+		} else {
+			m.isLoading = true
 		}
-		m.appendStreamContent(msg.Content)
-		m.isLoading = true
 		return m, nil
 
 	case events.ErrorEvent:
@@ -97,7 +99,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case events.ToolCall:
-		m.messages = append(m.messages, "[tool] "+msg.ToolName)
+		paramStr := string(msg.Params)
+		if len(paramStr) > 80 {
+			paramStr = paramStr[:80] + "..."
+		}
+		m.messages = append(m.messages, "[tool] "+msg.ToolName+" "+paramStr)
 		m.statusMsg = "执行: " + msg.ToolName
 		return m, nil
 
@@ -105,6 +111,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Error != "" {
 			m.messages = append(m.messages, "[tool error] "+msg.Error)
 			m.statusMsg = "工具错误: " + msg.Error
+		} else if msg.Result != "" {
+			shortResult := msg.Result
+			if len(shortResult) > 100 {
+				shortResult = shortResult[:100] + "..."
+			}
+			m.messages = append(m.messages, "[tool result] "+shortResult)
+			m.statusMsg = "工具完成: " + msg.ToolName
 		} else {
 			m.statusMsg = "工具完成: " + msg.ToolName
 		}

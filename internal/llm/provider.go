@@ -7,8 +7,20 @@ import (
 
 // Message 对话消息
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string        `json:"role"`
+	Content    string        `json:"content,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCallDef `json:"tool_calls,omitempty"`
+}
+
+// ToolCallDef 工具调用定义（用于消息历史中的tool_calls字段）
+type ToolCallDef struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // NewUserMessage 创建用户消息
@@ -35,15 +47,27 @@ func NewFileMessage(content string) Message {
 type AgentStreamCall struct {
 	Prompt      string    // 当前用户输入
 	Messages    []Message // 历史消息
+	Tools       []any     // 工具定义（OpenAI function format）
 	MaxTokens   int64     // 最大生成token数
 	Temperature float64   // 随机性控制(0-2)
 }
 
 // StreamingChunk 流式响应块
 type StreamingChunk struct {
-	Content string // 文本内容
-	Done    bool   // 流结束标志
-	Error   error  // 错误信息
+	Content   string          // 文本内容
+	ToolCalls []ToolCallDelta // 完整的工具调用（流结束后填充）
+	Done      bool            // 流结束标志
+	Error     error           // 错误信息
+}
+
+// ToolCallDelta 工具调用增量（对应OpenAI streaming tool_calls delta）
+type ToolCallDelta struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // Provider LLM提供商统一接口

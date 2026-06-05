@@ -210,14 +210,14 @@ func DefaultRules() []Rule {
 func DefaultWorkflow() Workflow {
 	return Workflow{
 		Before: []string{
-			"使用 read_file 读取相关文件",
-			"分析问题根源",
-			"规划修改方案",
+			"使用 view 工具读取相关文件",
+			"使用 grep 工具搜索代码",
+			"分析问题根源，规划修改方案",
 		},
 		During: []string{
-			"使用 edit_file 进行精确修改",
+			"使用 write 工具进行精确修改",
+			"使用 bash 工具执行命令和运行测试",
 			"一次只修改一个文件",
-			"保持代码风格一致",
 		},
 		After: []string{
 			"运行测试验证修改",
@@ -279,8 +279,9 @@ type Attachment struct {
 
 // Message 代理层消息类型（与llm.Message对应）
 type Message struct {
-	Role    MessageRole
-	Content string
+	Role       MessageRole
+	Content    string
+	ToolCallID string // 工具调用ID，用于关联tool消息与请求
 }
 
 // MessageRole 消息角色
@@ -290,6 +291,7 @@ const (
 	RoleUser      MessageRole = "user"
 	RoleAssistant MessageRole = "assistant"
 	RoleSystem    MessageRole = "system"
+	RoleTool      MessageRole = "tool"
 )
 
 // ShouldInclude 判断消息是否应包含在上下文中

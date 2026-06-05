@@ -8,10 +8,11 @@ import (
 
 // AgentResult Agent执行结果
 type AgentResult struct {
-	Response string
-	Session  *Session
-	Error    error
-	Stream   <-chan llm.StreamingChunk // 流式响应通道（非nil时表示流式输出）
+	Response  string
+	Session   *Session
+	Error     error
+	Stream    <-chan llm.StreamingChunk // 流式响应通道（非nil时表示流式输出）
+	ToolCalls []llm.ToolCallDelta      // LLM返回的工具调用（非空时需要执行后继续对话）
 }
 
 // SessionAgent 会话代理接口
@@ -25,7 +26,9 @@ type SessionAgentCall struct {
 	Prompt      string
 	Session     *Session
 	Attachments []Attachment
-	Complexity  float64 // 任务复杂度评估(0-1)，0表示允许使用小模型
+	Complexity  float64        // 任务复杂度评估(0-1)，0表示允许使用小模型
+	Tools       []any          // 工具定义（OpenAI function format），传给LLM
+	Messages    []llm.Message  // 对话历史（包含system prompt、历史消息、工具结果）
 }
 
 // Model LLM模型配置

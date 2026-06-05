@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -26,6 +27,8 @@ type OpenAIRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Stream      bool      `json:"stream"`
+	Tools       []any     `json:"tools,omitempty"`
+	ToolChoice  string    `json:"tool_choice,omitempty"`
 	MaxTokens   int64     `json:"max_tokens,omitempty"`
 	Temperature float64   `json:"temperature,omitempty"`
 }
@@ -34,13 +37,25 @@ type OpenAIRequest struct {
 type OpenAIStreamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Content          string           `json:"content"`
+			ReasoningContent string           `json:"reasoning_content"`
+			ToolCalls        []toolCallDelta  `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+// toolCallDelta OpenAI流式tool_calls增量（内部解析用）
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // OpenAIProvider OpenAI提供商实现
@@ -75,12 +90,17 @@ func (o *OpenAIProvider) Stream(ctx context.Context, call AgentStreamCall) (<-ch
 		Model:       o.model,
 		Messages:    messages,
 		Stream:      true,
+		Tools:       call.Tools,
+		ToolChoice:  "auto",
 		MaxTokens:   call.MaxTokens,
 		Temperature: call.Temperature,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+
+	log.Printf("[OpenAI] 请求模型=%s 消息数=%d 工具数=%d 请求体=%d字节",
+		o.model, len(messages), len(call.Tools), len(reqBody))
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		o.baseURL+"/chat/completions", bytes.NewBuffer(reqBody))
@@ -103,7 +123,7 @@ func (o *OpenAIProvider) Stream(ctx context.Context, call AgentStreamCall) (<-ch
 	}
 
 	ch := make(chan StreamingChunk, streamChunkBufferSize)
-	go o.readSSE(resp.Body, ch)
+	go o.readSSE(ctx, resp.Body, ch)
 	return ch, nil
 }
 
@@ -118,14 +138,29 @@ func (o *OpenAIProvider) Close() error {
 	return nil
 }
 
-// readSSE 解析SSE流式响应
-func (o *OpenAIProvider) readSSE(body io.ReadCloser, ch chan<- StreamingChunk) {
+// readSSE 解析SSE流式响应，累积tool_calls delta并在流结束时统一发送
+func (o *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, ch chan<- StreamingChunk) {
 	defer body.Close()
 	defer close(ch)
+	defer func() {
+		if r := recover(); r != nil {
+			ch <- StreamingChunk{Error: fmt.Errorf("readSSE panic: %v", r)}
+		}
+	}()
+
+	// 监听context取消，主动关闭body以解除scanner阻塞
+	go func() {
+		<-ctx.Done()
+		body.Close()
+	}()
 
 	scanner := bufio.NewScanner(body)
-	// 1MB最大缓冲区，防止超长JSON行
 	scanner.Buffer(make([]byte, 0, sseInitialBufferSize), sseMaxBufferSize)
+
+	log.Printf("[OpenAI] 开始读取SSE流")
+
+	// 累积tool_calls：key=index
+	toolCallsAcc := make(map[int]*ToolCallDelta)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -134,8 +169,16 @@ func (o *OpenAIProvider) readSSE(body io.ReadCloser, ch chan<- StreamingChunk) {
 		}
 		data := strings.TrimPrefix(line, "data: ")
 
-		// 结束标记
 		if data == "[DONE]" {
+			log.Printf("[OpenAI] SSE流完成，工具调用=%d个", len(toolCallsAcc))
+			// 发送累积的tool_calls
+			if len(toolCallsAcc) > 0 {
+				toolCalls := make([]ToolCallDelta, 0, len(toolCallsAcc))
+				for _, tc := range toolCallsAcc {
+					toolCalls = append(toolCalls, *tc)
+				}
+				ch <- StreamingChunk{ToolCalls: toolCalls}
+			}
 			ch <- StreamingChunk{Done: true}
 			return
 		}
@@ -143,10 +186,9 @@ func (o *OpenAIProvider) readSSE(body io.ReadCloser, ch chan<- StreamingChunk) {
 		var resp OpenAIStreamResponse
 		if err := json.Unmarshal([]byte(data), &resp); err != nil {
 			ch <- StreamingChunk{Error: err}
-			continue // 解析失败不中断流
+			continue
 		}
 
-		// API返回的错误
 		if resp.Error != nil {
 			ch <- StreamingChunk{Error: fmt.Errorf("%s", resp.Error.Message)}
 			continue
@@ -154,6 +196,24 @@ func (o *OpenAIProvider) readSSE(body io.ReadCloser, ch chan<- StreamingChunk) {
 
 		if len(resp.Choices) > 0 {
 			delta := resp.Choices[0].Delta
+
+			// 累积tool_calls delta
+			for _, tc := range delta.ToolCalls {
+				existing, ok := toolCallsAcc[tc.Index]
+				if !ok {
+					existing = &ToolCallDelta{ID: tc.ID, Type: tc.Type}
+					existing.Function.Name = tc.Function.Name
+					toolCallsAcc[tc.Index] = existing
+				}
+				if tc.Function.Arguments != "" {
+					existing.Function.Arguments += tc.Function.Arguments
+				}
+			}
+
+			// 将思考内容作为文本输出（DeepSeek-R1等推理模型）
+			if delta.ReasoningContent != "" {
+				ch <- StreamingChunk{Content: delta.ReasoningContent}
+			}
 			if delta.Content != "" {
 				ch <- StreamingChunk{Content: delta.Content}
 			}
@@ -163,4 +223,7 @@ func (o *OpenAIProvider) readSSE(body io.ReadCloser, ch chan<- StreamingChunk) {
 	if err := scanner.Err(); err != nil {
 		ch <- StreamingChunk{Error: fmt.Errorf("scanner error: %w", err)}
 	}
+	// 流异常结束（未收到[DONE]），发送完成信号避免调用方永久阻塞
+	log.Printf("[OpenAI] SSE流异常结束（未收到[DONE]），发送合成完成信号")
+	ch <- StreamingChunk{Done: true}
 }

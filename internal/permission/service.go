@@ -1,12 +1,14 @@
 package permission
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
-// PermLevel 权限等级
+// PermLevel 权限等级（Deprecated: 使用 Check 三层检查替代）
 type PermLevel int
 
 const (
@@ -16,8 +18,21 @@ const (
 	PermLevelAdmin                      // 3: 管理员，可执行命令
 )
 
-// PermissionService 权限控制服务
+// AuditRecord 权限检查审计记录
+type AuditRecord struct {
+	Timestamp time.Time
+	Tool      string
+	Params    string
+	Allowed   bool
+	Reason    string
+}
+
+// PermissionService 权限控制服务（三层检查：黑名单→白名单→确认）
 type PermissionService struct {
+	blacklist        map[string]bool
+	whitelist        map[string]bool
+	auditLog         []AuditRecord
+	auditMu          sync.Mutex
 	sessionPermCache map[string]PermLevel
 	fileWhitelist    []string
 	cmdWhitelist     []string
@@ -28,6 +43,9 @@ type PermissionService struct {
 // NewPermissionService 创建权限服务实例
 func NewPermissionService(defaultLevel PermLevel, fileWhitelist, cmdWhitelist []string) *PermissionService {
 	return &PermissionService{
+		blacklist:        make(map[string]bool),
+		whitelist:        make(map[string]bool),
+		auditLog:         make([]AuditRecord, 0),
 		sessionPermCache: make(map[string]PermLevel),
 		fileWhitelist:    fileWhitelist,
 		cmdWhitelist:     cmdWhitelist,
@@ -35,14 +53,76 @@ func NewPermissionService(defaultLevel PermLevel, fileWhitelist, cmdWhitelist []
 	}
 }
 
-// SetSessionLevel 设置会话权限等级
+// AddBlacklist 添加黑名单模式
+func (s *PermissionService) AddBlacklist(pattern string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blacklist[pattern] = true
+}
+
+// AddWhitelist 添加白名单模式
+func (s *PermissionService) AddWhitelist(pattern string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.whitelist[pattern] = true
+}
+
+// Check 执行三层权限检查（黑名单→白名单→确认）
+func (p *PermissionService) Check(tool string, params json.RawMessage) (allow bool, needConfirm bool, reason string) {
+	paramsStr := string(params)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 1. 黑名单检查（最高优先级）
+	for pattern := range p.blacklist {
+		if strings.Contains(paramsStr, pattern) {
+			p.log(tool, paramsStr, false, "命中黑名单: "+pattern)
+			return false, false, "操作被安全策略阻止"
+		}
+	}
+
+	// 2. 白名单检查
+	for pattern := range p.whitelist {
+		if strings.Contains(paramsStr, pattern) {
+			p.log(tool, paramsStr, true, "命中白名单")
+			return true, false, ""
+		}
+	}
+
+	// 3. 未分类操作需用户确认
+	p.log(tool, paramsStr, false, "等待用户确认")
+	return false, true, "操作需要用户确认"
+}
+
+// log 记录审计日志
+func (p *PermissionService) log(tool, params string, allowed bool, reason string) {
+	p.auditMu.Lock()
+	defer p.auditMu.Unlock()
+
+	record := AuditRecord{
+		Timestamp: time.Now(),
+		Tool:      tool,
+		Params:    params,
+		Allowed:   allowed,
+		Reason:    reason,
+	}
+	p.auditLog = append(p.auditLog, record)
+}
+
+// GetAuditLog 获取审计日志
+func (p *PermissionService) GetAuditLog() []AuditRecord {
+	return p.auditLog
+}
+
+// SetSessionLevel 设置会话权限等级（Deprecated）
 func (s *PermissionService) SetSessionLevel(sessionID string, level PermLevel) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessionPermCache[sessionID] = level
 }
 
-// GetSessionLevel 获取会话权限等级
+// GetSessionLevel 获取会话权限等级（Deprecated）
 func (s *PermissionService) GetSessionLevel(sessionID string) PermLevel {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -57,7 +137,7 @@ func (s *PermissionService) getSessionLevelLocked(sessionID string) PermLevel {
 	return s.defaultLevel
 }
 
-// CheckToolPermission 双重校验：权限等级 + 操作范围白名单
+// CheckToolPermission 双重校验：权限等级 + 操作范围白名单（Deprecated: 使用 Check 方法替代）
 func (s *PermissionService) CheckToolPermission(
 	sessionID string,
 	minPermLevel int,
@@ -67,7 +147,7 @@ func (s *PermissionService) CheckToolPermission(
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// 1. 粗粒度：权限等级校验（使用无锁版本避免重入死锁）
+	// 1. 粗粒度：权限等级校验
 	permLevel := s.getSessionLevelLocked(sessionID)
 	if permLevel < PermLevel(minPermLevel) {
 		return fmt.Errorf("权限不足：会话等级 %d < 工具要求 %d", permLevel, minPermLevel)

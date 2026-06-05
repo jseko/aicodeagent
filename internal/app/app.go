@@ -24,7 +24,7 @@ type App struct {
 
 	Coordinator    agent.Coordinator
 	SessionService agent.SessionService
-	ToolRegistry   *tools.ToolRegistry
+	ToolRegistry   *tools.Registry
 	PermService    *permission.PermissionService
 	Broker         *pubsub.Broker[events.Event]
 }
@@ -54,7 +54,7 @@ func New(ctx context.Context, cfg *config.Config) *App {
 	messageService := newMemoryMessageService()
 
 	// 初始化工具注册表
-	toolRegistry := tools.NewToolRegistry()
+	toolRegistry := tools.NewRegistry()
 	registerDefaultTools(toolRegistry)
 
 	// 初始化权限服务
@@ -64,6 +64,14 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		cfg.Permission.FileWhitelist,
 		cfg.Permission.CmdWhitelist,
 	)
+	// 配置默认黑名单：危险命令模式
+	permService.AddBlacklist("rm")
+	permService.AddBlacklist("sudo")
+	permService.AddBlacklist("/etc/passwd")
+	permService.AddBlacklist("chmod")
+	permService.AddBlacklist("mkfs")
+	// 配置默认白名单：工作目录内操作
+	permService.AddWhitelist("/workspace")
 
 	// 初始化事件总线
 	broker := pubsub.NewBroker[events.Event]()
@@ -129,34 +137,11 @@ func (a *App) StartEventLoop(ctx context.Context) {
 }
 
 // registerDefaultTools 注册默认工具
-func registerDefaultTools(registry *tools.ToolRegistry) {
-	registry.Register(&tools.ToolMeta{
-		ID:           "file_read",
-		Name:         "读取文件",
-		Type:         tools.ToolTypeFile,
-		Description:  "读取指定路径的文件内容",
-		Params:       []tools.ParamMeta{{Name: "path", Type: "string", Required: true}},
-		MinPermLevel: int(permission.PermLevelNormal),
-		Enabled:      true,
-	})
-	registry.Register(&tools.ToolMeta{
-		ID:           "file_write",
-		Name:         "写入文件",
-		Type:         tools.ToolTypeFile,
-		Description:  "向指定路径写入内容",
-		Params:       []tools.ParamMeta{{Name: "path", Type: "string", Required: true}, {Name: "content", Type: "string", Required: true}},
-		MinPermLevel: int(permission.PermLevelAdvanced),
-		Enabled:      true,
-	})
-	registry.Register(&tools.ToolMeta{
-		ID:           "terminal_exec",
-		Name:         "执行命令",
-		Type:         tools.ToolTypeTerminal,
-		Description:  "在终端中执行命令",
-		Params:       []tools.ParamMeta{{Name: "command", Type: "string", Required: true}},
-		MinPermLevel: int(permission.PermLevelAdmin),
-		Enabled:      true,
-	})
+func registerDefaultTools(registry *tools.Registry) {
+	registry.Register(tools.NewView("."))
+	registry.Register(tools.NewBash("."))
+	registry.Register(tools.NewWrite("."))
+	registry.Register(tools.NewGrep("."))
 }
 
 // memoryCache 内存缓存实现

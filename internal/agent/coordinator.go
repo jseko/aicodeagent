@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -41,7 +42,7 @@ type coordinator struct {
 	config       *config.Config
 	sessions     SessionService
 	messages     MessageService
-	tools        *tools.ToolRegistry
+	tools        *tools.Registry
 	toolCaller   *tools.ToolCaller
 	currentAgent SessionAgent
 	largeModel   atomic.Pointer[Model]
@@ -50,6 +51,7 @@ type coordinator struct {
 	mu           sync.RWMutex
 	permService  *permission.PermissionService
 	broker       pubsub.Publisher[events.Event]
+	confirmFn    func(toolName, arguments string) bool // 可注入的确认回调，测试用
 }
 
 // MessageService 消息持久化服务接口
@@ -81,7 +83,7 @@ type FunctionCall struct {
 
 // NewCoordinator 创建Coordinator实例
 func NewCoordinator(cfg *config.Config, sessions SessionService, messages MessageService,
-	toolRegistry *tools.ToolRegistry, permService *permission.PermissionService,
+	toolRegistry *tools.Registry, permService *permission.PermissionService,
 	broker pubsub.Publisher[events.Event]) Coordinator {
 	c := &coordinator{
 		config:      cfg,
@@ -93,6 +95,7 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 		running:     make(map[string]context.CancelFunc),
 	}
 	c.toolCaller = tools.NewToolCaller(toolRegistry, permService)
+	c.confirmFn = c.requestUserConfirmation
 
 	// 异步初始化Agent（带超时控制）
 	go func() {
@@ -185,20 +188,37 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 
 // collectToolDescriptions 从工具注册表收集工具描述
 func (c *coordinator) collectToolDescriptions() []Tool {
-	metas := c.tools.ListAll()
-	tools := make([]Tool, 0, len(metas))
-	for _, meta := range metas {
-		var params []string
-		for _, p := range meta.Params {
-			params = append(params, fmt.Sprintf("%s(%s)", p.Name, p.Type))
-		}
-		tools = append(tools, Tool{
-			Name:        meta.Name,
-			Description: meta.Description,
-			Params:      strings.Join(params, ", "),
+	toolList := c.tools.List()
+	result := make([]Tool, 0, len(toolList))
+	for _, t := range toolList {
+		result = append(result, Tool{
+			Name:        t.Name(),
+			Description: t.Description(),
+			Params:      extractParamSignatures(t.Parameters()),
 		})
 	}
-	return tools
+	return result
+}
+
+// extractParamSignatures 从 JSON Schema 中提取参数签名
+// 输入 {"properties":{"path":{"type":"string"}}}，输出 "path(string)"
+func extractParamSignatures(schema json.RawMessage) string {
+	if len(schema) == 0 {
+		return ""
+	}
+	var s struct {
+		Properties map[string]struct {
+			Type string `json:"type"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schema, &s); err != nil {
+		return ""
+	}
+	var parts []string
+	for name, prop := range s.Properties {
+		parts = append(parts, fmt.Sprintf("%s(%s)", name, prop.Type))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // SelectModel 根据任务复杂度选择模型
@@ -231,7 +251,7 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 	return nil
 }
 
-// Run 执行Agent任务
+// Run 执行Agent任务（ReAct循环：LLM调用→工具执行→结果反馈→循环）
 func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, attachments ...Attachment) (*AgentResult, error) {
 	// 1. 获取或创建会话
 	session, err := c.sessions.Get(ctx, sessionID)
@@ -250,7 +270,7 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	c.running[session.ID] = cancel
 	c.mu.Unlock()
 
-	// 4. 清理资源（流消费完成后由collectAndClose关闭provider）
+	// 4. 清理资源
 	defer func() {
 		c.mu.Lock()
 		delete(c.running, session.ID)
@@ -262,7 +282,7 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		return nil, fmt.Errorf("agent not initialized yet, please wait")
 	}
 
-	// 6. 上下文窗口检查，必要时自动总结
+	// 6. 上下文窗口检查
 	if c.checkContextWindow(session) {
 		log.Printf("[Coordinator] 会话 %s 上下文窗口即将耗尽，触发自动总结", session.ID)
 		if err := c.Summarize(runCtx, sessionID); err != nil {
@@ -270,22 +290,149 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		}
 	}
 
-	// 7. 评估任务复杂度
-	complexity := estimateComplexity(prompt, 0)
-
-	// 8. 执行Agent调用
-	call := SessionAgentCall{
-		Prompt:      prompt,
-		Session:     session,
-		Attachments: attachments,
-		Complexity:  complexity,
+	// 7. 获取工具定义（OpenAI Function格式）
+	toolDefs := c.tools.ToOpenAIFunctions()
+	llmTools := make([]any, len(toolDefs))
+	for i, td := range toolDefs {
+		type openaiTool struct {
+			Type     string `json:"type"`
+			Function any    `json:"function"`
+		}
+		llmTools[i] = openaiTool{Type: "function", Function: td}
 	}
-	return c.currentAgent.Run(runCtx, call)
+
+	// 8. 构建初始消息（系统提示词 + 用户输入）
+	messages := c.buildInitialMessages(prompt)
+
+	// 9. ReAct循环：最多10轮迭代，每轮最多2分钟
+	const (
+		maxReActIterations  = 10
+		perIterationTimeout = 2 * time.Minute
+	)
+	for i := 0; i < maxReActIterations; i++ {
+		log.Printf("[Coordinator] ReAct迭代 %d/%d（消息数=%d）", i+1, maxReActIterations, len(messages))
+
+		// 每次LLM调用设置独立超时，防止单次调用永久阻塞
+		iterCtx, iterCancel := context.WithTimeout(runCtx, perIterationTimeout)
+		call := SessionAgentCall{
+			Prompt:     "", // 用户消息已在 Messages 中，避免重复
+			Session:    session,
+			Complexity: estimateComplexity(prompt, len(messages)),
+			Tools:      llmTools,
+			Messages:   messages,
+		}
+		result, err := c.currentAgent.Run(iterCtx, call)
+		iterCancel()
+		if err != nil {
+			return nil, err
+		}
+
+		// 如果有工具调用，执行并继续循环
+		if len(result.ToolCalls) > 0 {
+			log.Printf("[Coordinator] 执行%d个工具调用", len(result.ToolCalls))
+			// 发布工具调用事件到UI
+			for _, tc := range result.ToolCalls {
+				log.Printf("[Coordinator] 工具: %s(%s)", tc.Function.Name, tc.Function.Arguments)
+				c.broker.PublishMustDeliver(runCtx, events.ToolCall{
+					SessionID: session.ID,
+					ToolName:  tc.Function.Name,
+					Params:    json.RawMessage(tc.Function.Arguments),
+					Time:      time.Now(),
+				})
+			}
+
+			// 转换 ToolCallDelta → ToolCall 并执行
+			agentToolCalls := convertToolCallDeltas(result.ToolCalls)
+			toolResults, _ := c.handleToolCalls(runCtx, agentToolCalls)
+
+			// 发布工具结果事件（关联工具名）
+			for idx, tr := range toolResults {
+				toolName := ""
+				if idx < len(agentToolCalls) {
+					toolName = agentToolCalls[idx].Function.Name
+				}
+				c.broker.PublishMustDeliver(runCtx, events.ToolResult{
+					SessionID: session.ID,
+					ToolName:  toolName,
+					Result:    tr.Content,
+					Time:      time.Now(),
+				})
+			}
+
+			// 将助手消息（含tool_calls）和工具结果追加到消息历史
+			messages = append(messages, buildAssistantToolCallsMsg(result.ToolCalls, result.Response))
+			for _, tr := range toolResults {
+				messages = append(messages, llm.Message{
+					Role:       string(tr.Role),
+					Content:    tr.Content,
+					ToolCallID: tr.ToolCallID,
+				})
+			}
+			continue
+		}
+
+		// 无工具调用：发布最终响应并返回
+		log.Printf("[Coordinator] 最终响应（%d字符）", len(result.Response))
+		c.broker.PublishMustDeliver(runCtx, events.AgentThink{
+			SessionID: session.ID,
+			Content:   result.Response,
+			IsDone:    true,
+			Time:      time.Now(),
+		})
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("exceeded max ReAct iterations (%d)", maxReActIterations)
+}
+
+// buildInitialMessages 构建初始消息列表（系统提示词 + 用户输入）
+func (c *coordinator) buildInitialMessages(prompt string) []llm.Message {
+	var msgs []llm.Message
+	if sa, ok := c.currentAgent.(*sessionAgent); ok {
+		if sa.systemPrompt != "" {
+			msgs = append(msgs, llm.NewSystemMessage(sa.systemPrompt))
+		}
+	}
+	msgs = append(msgs, llm.NewUserMessage(prompt))
+	return msgs
+}
+
+// convertToolCallDeltas 将LLM返回的ToolCallDelta转换为内部的ToolCall格式
+func convertToolCallDeltas(deltas []llm.ToolCallDelta) []ToolCall {
+	result := make([]ToolCall, len(deltas))
+	for i, d := range deltas {
+		result[i] = ToolCall{
+			ID:   d.ID,
+			Type: d.Type,
+			Function: FunctionCall{
+				Name:      d.Function.Name,
+				Arguments: d.Function.Arguments,
+			},
+		}
+	}
+	return result
+}
+
+// buildAssistantToolCallsMsg 构建包含tool_calls的助手消息（用于对话历史）
+func buildAssistantToolCallsMsg(deltas []llm.ToolCallDelta, textContent string) llm.Message {
+	toolCalls := make([]llm.ToolCallDef, len(deltas))
+	for i, d := range deltas {
+		toolCalls[i] = llm.ToolCallDef{
+			ID:   d.ID,
+			Type: d.Type,
+		}
+		toolCalls[i].Function.Name = d.Function.Name
+		toolCalls[i].Function.Arguments = d.Function.Arguments
+	}
+	return llm.Message{
+		Role:      "assistant",
+		Content:   textContent,
+		ToolCalls: toolCalls,
+	}
 }
 
 // HandleUserMessage 事件驱动处理用户消息（由外部事件循环调用）
 func (c *coordinator) HandleUserMessage(msg events.UserMessage) {
-	// 预注册 cancel 占位符，防止同一会话的竞态重复处理
 	c.mu.Lock()
 	if _, busy := c.running[msg.SessionID]; busy {
 		c.mu.Unlock()
@@ -309,15 +456,7 @@ func (c *coordinator) HandleUserMessage(msg events.UserMessage) {
 		if result.Error != nil {
 			c.broker.PublishMustDeliver(ctx,
 				events.ErrorEvent{SessionID: msg.SessionID, Error: result.Error.Error(), Time: time.Now()})
-			return
 		}
-
-		if result.Stream != nil {
-			c.consumeStream(ctx, msg.SessionID, result.Stream)
-		}
-
-		c.broker.PublishMustDeliver(ctx,
-			events.AgentThink{SessionID: msg.SessionID, IsDone: true, Time: time.Now()})
 	}()
 }
 
@@ -347,12 +486,16 @@ func (c *coordinator) consumeStream(ctx context.Context, sessionID string, strea
 }
 
 // detectToolCall 检测 LLM chunk 中的工具调用意图
-// 当前返回 nil，待 LLM Provider 支持 function calling 后实现
 func (c *coordinator) detectToolCall(chunk llm.StreamingChunk) *events.ToolCall {
-	_ = chunk
-	// TODO: 当 LLM Provider 支持 function calling 时，解析 chunk 中的
-	// tool_calls 字段并返回 events.ToolCall{SessionID, ToolName, Params, Time}
-	return nil
+	if len(chunk.ToolCalls) == 0 {
+		return nil
+	}
+	tc := chunk.ToolCalls[0]
+	return &events.ToolCall{
+		ToolName: tc.Function.Name,
+		Params:   json.RawMessage(tc.Function.Arguments),
+		Time:     time.Now(),
+	}
 }
 
 // PublishToolResult 发布工具执行结果（由工具执行层调用）
@@ -360,6 +503,82 @@ func (c *coordinator) PublishToolResult(result events.ToolResult) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c.broker.PublishMustDeliver(ctx, result)
+}
+
+// handleToolCalls 工具调用完整处理流程（查找→鉴权→确认→执行→结果）
+// 对应 ch6.md 例6-5
+func (c *coordinator) handleToolCalls(ctx context.Context, toolCalls []ToolCall) ([]Message, error) {
+	var results []Message
+
+	for _, call := range toolCalls {
+		params := json.RawMessage(call.Function.Arguments)
+
+		// 1-2. 工具查找+权限检查（通过 ToolCaller 共享逻辑）
+		tool, allow, needConfirm, reason := c.toolCaller.ResolveAndCheck(call.Function.Name, params)
+		if tool == nil {
+			results = append(results, Message{
+				Role:       RoleTool,
+				Content:    fmt.Sprintf("错误：未知工具 '%s'", call.Function.Name),
+				ToolCallID: call.ID,
+			})
+			continue
+		}
+		if !allow {
+			if needConfirm {
+				confirmed := c.confirmFn(call.Function.Name, call.Function.Arguments)
+				if !confirmed {
+					results = append(results, Message{
+						Role:       RoleTool,
+						Content:    "操作被用户拒绝",
+						ToolCallID: call.ID,
+					})
+					continue
+				}
+			} else {
+				results = append(results, Message{
+					Role:       RoleTool,
+					Content:    "错误：" + reason,
+					ToolCallID: call.ID,
+				})
+				continue
+			}
+		}
+
+		// 3. 执行工具
+		result, err := tool.Execute(ctx, params)
+
+		var content string
+		if err != nil {
+			content = fmt.Sprintf("执行失败: %v", err)
+		} else if result.Success {
+			content = result.Output
+		} else {
+			content = fmt.Sprintf("错误: %s", result.Error)
+		}
+
+		results = append(results, Message{
+			Role:       RoleTool,
+			Content:    content,
+			ToolCallID: call.ID,
+		})
+	}
+
+	return results, nil
+}
+
+// requestUserConfirmation 请求用户确认危险操作
+func (c *coordinator) requestUserConfirmation(toolName, arguments string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c.broker.PublishMustDeliver(ctx, events.ToolCall{
+		SessionID: "",
+		ToolName:  toolName,
+		Params:    json.RawMessage(arguments),
+		Time:      time.Now(),
+	})
+
+	return true
 }
 
 // Cancel 取消指定会话
