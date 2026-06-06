@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"AICodeAgent/internal/agent/tools"
 	"AICodeAgent/internal/config"
 	"AICodeAgent/internal/events"
+	"AICodeAgent/internal/mcp"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
 )
@@ -98,12 +100,16 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		Broker:         broker,
 	}
 
+	// 后台初始化 MCP 工具
+	go app.initMCP()
+
 	logger.Info("App初始化完成")
 	return app
 }
 
 // Close 优雅关闭程序
 func (a *App) Close() {
+	mcp.Close()
 	if a.Coordinator != nil {
 		a.Coordinator.CancelAll()
 	}
@@ -134,6 +140,41 @@ func (a *App) StartEventLoop(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// initMCP 后台初始化所有 MCP Server 连接并注册工具
+func (a *App) initMCP() {
+	if len(a.Config.MCP) == 0 {
+		return
+	}
+
+	// 转换 config.MCPConfig → mcp.MCPConfigAdapter
+	cfgs := make(map[string]mcp.MCPConfigAdapter, len(a.Config.MCP))
+	for name, cfg := range a.Config.MCP {
+		cfgs[name] = mcp.MCPConfigAdapter{
+			Type:          cfg.Type,
+			Command:       cfg.Command,
+			Args:          cfg.Args,
+			URL:           cfg.URL,
+			Timeout:       cfg.Timeout,
+			Disabled:      cfg.Disabled,
+			DisabledTools: cfg.DisabledTools,
+			Env:           cfg.Env,
+			Headers:       cfg.Headers,
+		}
+	}
+
+	mcp.Initialize(a.Ctx, cfgs)
+
+	// 将 MCP 工具注册到工具注册表
+	sessions := mcp.ListSessions()
+	for name, sess := range sessions {
+		mcpTools := mcp.GetMCPTools(name, sess.Tools(), sess)
+		for _, tool := range mcpTools {
+			a.ToolRegistry.Register(tool)
+		}
+		log.Printf("[App] 已注册 MCP Server %s 的 %d 个工具", name, len(mcpTools))
+	}
 }
 
 // registerDefaultTools 注册默认工具

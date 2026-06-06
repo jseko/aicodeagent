@@ -37,3 +37,32 @@ permission:
     - "cat"
 
 summary_prompt: "请用简洁的语言总结以下对话的关键要点，保留所有技术细节。"
+
+# MCP 服务器配置：连接外部工具生态
+# STDIO 模式（通过 npx 启动 Node.js 进程）：
+mcp:
+  context7:
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp@latest"]
+    timeout: 30
+#   github:
+#     type: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     timeout: 30
+#     env:
+#       GITHUB_TOKEN: "${GITHUB_TOKEN}"
+# HTTP 模式（直连远程服务）：
+# mcp:
+#   github:
+#     type: http
+#     url: https://api.githubcopilot.com/mcp/
+#     timeout: 120
+#     headers:
+#       Authorization: "Bearer ${GITHUB_TOKEN}"
+#   filesystem:
+#     type: stdio
+#     command: node
+#     args: ["/path/to/mcp-server-filesystem.js"]
+#     timeout: 30

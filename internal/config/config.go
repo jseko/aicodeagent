@@ -9,15 +9,16 @@ import (
 )
 
 type Config struct {
-	Theme       string         `yaml:"theme"`
-	OpenAI      OpenAI         `yaml:"openai"`
-	SkillsPaths []string       `yaml:"skills_paths"`
-	LogLevel    string         `yaml:"log_level"`
-	Agent       AgentConfig    `yaml:"agent"`
-	Providers   []ProviderConfig `yaml:"providers"`
-	Session     SessionConfig  `yaml:"session"`
-	Permission  PermissionConfig `yaml:"permission"`
-	SummaryPrompt string       `yaml:"summary_prompt"`
+	Theme         string                 `yaml:"theme"`
+	OpenAI        OpenAI                 `yaml:"openai"`
+	SkillsPaths   []string               `yaml:"skills_paths"`
+	LogLevel      string                 `yaml:"log_level"`
+	Agent         AgentConfig            `yaml:"agent"`
+	Providers     []ProviderConfig       `yaml:"providers"`
+	Session       SessionConfig          `yaml:"session"`
+	Permission    PermissionConfig       `yaml:"permission"`
+	SummaryPrompt string                 `yaml:"summary_prompt"`
+	MCP           map[string]MCPConfig   `yaml:"mcp"`
 }
 
 type OpenAI struct {
@@ -52,6 +53,19 @@ type PermissionConfig struct {
 	DefaultLevel  int      `yaml:"default_level"`
 	FileWhitelist  []string `yaml:"file_whitelist"`
 	CmdWhitelist   []string `yaml:"cmd_whitelist"`
+}
+
+// MCPConfig MCP 服务器连接配置
+type MCPConfig struct {
+	Type          string            `yaml:"type"`           // stdio / http / sse
+	Command       string            `yaml:"command"`        // stdio 模式：可执行命令
+	Args          []string          `yaml:"args"`           // stdio 模式：命令参数
+	URL           string            `yaml:"url"`            // http/sse 模式：服务端点
+	Timeout       int               `yaml:"timeout"`        // 超时时间（秒），默认 15
+	Disabled      bool              `yaml:"disabled"`       // 是否禁用
+	DisabledTools []string          `yaml:"disabled_tools"` // 禁用的工具列表
+	Env           map[string]string `yaml:"env"`            // 环境变量
+	Headers       map[string]string `yaml:"headers"`        // HTTP 头（http/sse 模式）
 }
 
 func (c *Config) ResolveSecret(secretRef string) string {

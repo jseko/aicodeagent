@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"log"
+	"os"
 	"strings"
 
 	"AICodeAgent/internal/app"
@@ -181,8 +183,16 @@ func (m *Model) ListenEvents(ctx context.Context, program *tea.Program) {
 
 // Start 启动 TUI 循环
 func Start(a *app.App) error {
+	// 将 log 输出重定向到文件，防止干扰 TUI 终端渲染
+	logFile, logErr := os.OpenFile("aicodeagent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if logErr == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+
 	m := New(a)
-	p := tea.NewProgram(m)
+	// 使用 os.Stdin/stdout 替代默认的 /dev/tty，兼容更多终端环境
+	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
 
 	ctx, cancel := context.WithCancel(a.Ctx)
 	defer cancel()

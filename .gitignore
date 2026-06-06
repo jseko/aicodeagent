@@ -2,4 +2,5 @@
 .spec-workflow/
 openspec/
 AICodeAgent
+aicodeagent.log
 .chat/
