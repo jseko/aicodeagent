@@ -35,10 +35,11 @@ func (e UserMessage) Timestamp() time.Time { return e.Time }
 
 // AgentThink AI 流式响应事件
 type AgentThink struct {
-	SessionID string    `json:"session_id"`
-	Content   string    `json:"content"`
-	IsDone    bool      `json:"is_done"`
-	Time      time.Time `json:"time"`
+	SessionID        string    `json:"session_id"`
+	Content          string    `json:"content"`
+	ReasoningContent string    `json:"reasoning_content,omitempty"` // 推理/思考内容
+	IsDone           bool      `json:"is_done"`
+	Time             time.Time `json:"time"`
 }
 
 func (e AgentThink) Type() EventType      { return TypeAgentThink }

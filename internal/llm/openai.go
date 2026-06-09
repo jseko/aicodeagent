@@ -210,9 +210,9 @@ func (o *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, ch cha
 				}
 			}
 
-			// 将思考内容作为文本输出（DeepSeek-R1等推理模型）
+			// 将思考内容作为独立字段输出（DeepSeek-R1等推理模型）
 			if delta.ReasoningContent != "" {
-				ch <- StreamingChunk{Content: delta.ReasoningContent}
+				ch <- StreamingChunk{ReasoningContent: delta.ReasoningContent}
 			}
 			if delta.Content != "" {
 				ch <- StreamingChunk{Content: delta.Content}

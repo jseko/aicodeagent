@@ -119,8 +119,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 		return &AgentResult{Session: call.Session, Error: err}, err
 	}
 
-	// 4. 收集所有chunk：文本内容 + 工具调用
+	// 4. 收集所有chunk：文本内容 + 推理内容 + 工具调用
 	var fullText string
+	var reasoningText string
 	var toolCalls []llm.ToolCallDelta
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -134,17 +135,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 			toolCalls = chunk.ToolCalls
 			log.Printf("[SessionAgent] 检测到工具调用: %d个", len(toolCalls))
 		}
+		if chunk.ReasoningContent != "" {
+			reasoningText += chunk.ReasoningContent
+		}
 		if chunk.Content != "" {
 			fullText += chunk.Content
 		}
 	}
 
-	log.Printf("[SessionAgent] LLM响应完成（文本=%d字符, 工具调用=%d个）", len(fullText), len(toolCalls))
+	log.Printf("[SessionAgent] LLM响应完成（文本=%d字符, 推理=%d字符, 工具调用=%d个）", len(fullText), len(reasoningText), len(toolCalls))
 
 	// 5. 返回收集到的完整响应
 	return &AgentResult{
 		Session:   call.Session,
 		Response:  fullText,
+		Reasoning: reasoningText,
 		ToolCalls: toolCalls,
 	}, nil
 }

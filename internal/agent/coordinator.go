@@ -48,6 +48,7 @@ type coordinator struct {
 	largeModel   atomic.Pointer[Model]
 	smallModel   atomic.Pointer[Model]
 	running      map[string]context.CancelFunc
+	sessionIDs   map[string]string // 请求ID → 实际会话ID 映射
 	mu           sync.RWMutex
 	permService  *permission.PermissionService
 	broker       pubsub.Publisher[events.Event]
@@ -93,6 +94,7 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 		permService: permService,
 		broker:      broker,
 		running:     make(map[string]context.CancelFunc),
+		sessionIDs:  make(map[string]string),
 	}
 	c.toolCaller = tools.NewToolCaller(toolRegistry, permService)
 	c.confirmFn = c.requestUserConfirmation
@@ -253,13 +255,27 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 
 // Run 执行Agent任务（ReAct循环：LLM调用→工具执行→结果反馈→循环）
 func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, attachments ...Attachment) (*AgentResult, error) {
-	// 1. 获取或创建会话
-	session, err := c.sessions.Get(ctx, sessionID)
+	// 1. 获取或创建会话（优先使用已映射的实际会话ID）
+	c.mu.RLock()
+	actualID, hasMapping := c.sessionIDs[sessionID]
+	c.mu.RUnlock()
+
+	var session *Session
+	var err error
+	if hasMapping {
+		session, err = c.sessions.Get(ctx, actualID)
+	}
+	if session == nil && err == nil {
+		session, err = c.sessions.Get(ctx, sessionID)
+	}
 	if err != nil {
 		session, err = c.sessions.Create(ctx, "New Session")
 		if err != nil {
 			return nil, fmt.Errorf("create session: %w", err)
 		}
+		c.mu.Lock()
+		c.sessionIDs[sessionID] = session.ID
+		c.mu.Unlock()
 	}
 
 	// 2. 创建可取消上下文
@@ -372,7 +388,16 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		}
 
 		// 无工具调用：发布最终响应并返回
-		log.Printf("[Coordinator] 最终响应（%d字符）", len(result.Response))
+		log.Printf("[Coordinator] 最终响应（%d字符, 推理=%d字符）", len(result.Response), len(result.Reasoning))
+		// 先发布推理内容（思考过程）
+		if result.Reasoning != "" {
+			c.broker.PublishMustDeliver(runCtx, events.AgentThink{
+				SessionID:        session.ID,
+				ReasoningContent: result.Reasoning,
+				Time:             time.Now(),
+			})
+		}
+		// 再发布正文内容
 		c.broker.PublishMustDeliver(runCtx, events.AgentThink{
 			SessionID: session.ID,
 			Content:   result.Response,
@@ -443,6 +468,13 @@ func (c *coordinator) HandleUserMessage(msg events.UserMessage) {
 	c.mu.Unlock()
 
 	go func() {
+		// 确保占位符被清理
+		defer func() {
+			c.mu.Lock()
+			delete(c.running, msg.SessionID)
+			c.mu.Unlock()
+		}()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 

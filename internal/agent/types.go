@@ -9,6 +9,7 @@ import (
 // AgentResult Agent执行结果
 type AgentResult struct {
 	Response  string
+	Reasoning string // 推理/思考内容（DeepSeek-R1等）
 	Session   *Session
 	Error     error
 	Stream    <-chan llm.StreamingChunk // 流式响应通道（非nil时表示流式输出）

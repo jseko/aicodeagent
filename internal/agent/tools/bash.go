@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -58,9 +59,11 @@ func (b *Bash) Execute(ctx context.Context, params json.RawMessage) (Result, err
 	defer cancel()
 
 	absDir, _ := filepath.Abs(b.workingDir)
-	cmd := exec.CommandContext(execCtx, "bash", "-c", p.Command)
+	shell, shellArgs := getPlatformShell()
+	args := append(shellArgs, p.Command)
+	cmd := exec.CommandContext(execCtx, shell, args...)
 	cmd.Dir = absDir
-	cmd.Env = os.Environ()
+	cmd.Env = prepareShellEnv()
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -78,4 +81,28 @@ func (b *Bash) Execute(ctx context.Context, params json.RawMessage) (Result, err
 		content = "(命令执行成功，无输出)"
 	}
 	return Result{Success: true, Output: content}, nil
+}
+
+// getPlatformShell 跨平台 Shell 检测（例9-17）
+func getPlatformShell() (string, []string) {
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("pwsh"); err == nil {
+			return "pwsh", []string{"-Command"}
+		}
+		return "powershell", []string{"-Command"}
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash", []string{"-c"}
+	}
+	return "sh", []string{"-c"}
+}
+
+// prepareShellEnv 准备跨平台环境变量（例9-17）
+func prepareShellEnv() []string {
+	env := os.Environ()
+	env = append(env, "TERM=xterm-256color")
+	if runtime.GOOS == "windows" {
+		env = append(env, "LC_ALL=C.UTF-8", "LANG=C.UTF-8")
+	}
+	return env
 }

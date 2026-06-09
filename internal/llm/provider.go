@@ -54,10 +54,11 @@ type AgentStreamCall struct {
 
 // StreamingChunk 流式响应块
 type StreamingChunk struct {
-	Content   string          // 文本内容
-	ToolCalls []ToolCallDelta // 完整的工具调用（流结束后填充）
-	Done      bool            // 流结束标志
-	Error     error           // 错误信息
+	Content          string          // 文本内容
+	ReasoningContent string          // 推理/思考内容（DeepSeek-R1 等推理模型）
+	ToolCalls        []ToolCallDelta // 完整的工具调用（流结束后填充）
+	Done             bool            // 流结束标志
+	Error            error           // 错误信息
 }
 
 // ToolCallDelta 工具调用增量（对应OpenAI streaming tool_calls delta）
