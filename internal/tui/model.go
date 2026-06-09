@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"AICodeAgent/internal/app"
 	"AICodeAgent/internal/events"
@@ -25,6 +27,10 @@ type Model struct {
 	ready      bool
 	isLoading  bool
 	statusMsg  string
+	width      int
+	height     int
+	history    []string
+	historyIdx int
 }
 
 // 消息样式
@@ -55,6 +61,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.ready = true
+		m.width = msg.Width
+		m.height = msg.Height
 		return m, nil
 
 	case tea.KeyMsg:
@@ -62,24 +70,68 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		switch msg.String() {
-		case "ctrl+c", "q":
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
-		case "enter":
-			if m.input != "" {
-				m.messages = append(m.messages, "You: "+m.input)
-				m.isLoading = true
-				m.statusMsg = "正在思考..."
-				m.pub.Publish(events.UserMessage{
-					SessionID: m.sessionID,
-					Content:   m.input,
-				})
-				m.input = ""
+
+		case tea.KeyEnter:
+			if strings.TrimSpace(m.input) == "" {
 				return m, nil
 			}
+			content := m.input
+			m.messages = append(m.messages, "You: "+content)
+			m.history = append(m.history, content)
+			m.historyIdx = len(m.history)
+			m.isLoading = true
+			m.statusMsg = "正在思考..."
+			m.pub.Publish(events.UserMessage{
+				SessionID: m.sessionID,
+				Content:   content,
+			})
+			m.input = ""
 			return m, nil
+
+		case tea.KeyBackspace, tea.KeyDelete:
+			runes := []rune(m.input)
+			if len(runes) > 0 {
+				m.input = string(runes[:len(runes)-1])
+			}
+			return m, nil
+
+		case tea.KeyUp:
+			if len(m.history) > 0 && m.historyIdx > 0 {
+				m.historyIdx--
+				m.input = m.history[m.historyIdx]
+			}
+			return m, nil
+
+		case tea.KeyDown:
+			if m.historyIdx < len(m.history)-1 {
+				m.historyIdx++
+				m.input = m.history[m.historyIdx]
+			} else {
+				m.historyIdx = len(m.history)
+				m.input = ""
+			}
+			return m, nil
+
+		case tea.KeyRunes:
+			for _, r := range msg.Runes {
+				if r == utf8.RuneError || (unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t') {
+					continue
+				}
+				m.input += string(r)
+			}
+			return m, nil
+
 		default:
-			m.input += msg.String()
+			switch msg.String() {
+			case "backspace", "ctrl+h", "delete":
+				runes := []rune(m.input)
+				if len(runes) > 0 {
+					m.input = string(runes[:len(runes)-1])
+				}
+			}
 			return m, nil
 		}
 
@@ -137,13 +189,19 @@ func (m Model) View() string {
 
 	var b strings.Builder
 
+	// 根据终端宽度动态设置消息样式，自动换行
+	styled := msgStyle
+	if m.width > 0 {
+		styled = styled.Width(m.width - 4) // 留出内边距和滚动条空间
+	}
+
 	// 长会话性能优化：仅渲染最近 500 条消息
 	start := 0
 	if len(m.messages) > 500 {
 		start = len(m.messages) - 500
 	}
 	for _, msg := range m.messages[start:] {
-		b.WriteString(msgStyle.Render(msg) + "\n")
+		b.WriteString(styled.Render(msg) + "\n")
 	}
 
 	if m.isLoading {
@@ -191,8 +249,7 @@ func Start(a *app.App) error {
 	}
 
 	m := New(a)
-	// 使用 os.Stdin/stdout 替代默认的 /dev/tty，兼容更多终端环境
-	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+	p := tea.NewProgram(m)
 
 	ctx, cancel := context.WithCancel(a.Ctx)
 	defer cancel()
