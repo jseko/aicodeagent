@@ -6,11 +6,19 @@ import (
 )
 
 // Message 对话消息
+type Usage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+}
+
 type Message struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCallDef `json:"tool_calls,omitempty"`
+	Role             string        `json:"role"`
+	Content          string        `json:"content,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	ToolCalls        []ToolCallDef `json:"tool_calls,omitempty"`
+	ID               string        `json:"id,omitempty"`
+	IsSummaryMessage bool          `json:"is_summary_message,omitempty"`
 }
 
 // ToolCallDef 工具调用定义（用于消息历史中的tool_calls字段）
@@ -50,6 +58,7 @@ type AgentStreamCall struct {
 	Tools       []any     // 工具定义（OpenAI function format）
 	MaxTokens   int64     // 最大生成token数
 	Temperature float64   // 随机性控制(0-2)
+	TopP        float64   // 核采样阈值(0-1)
 }
 
 // StreamingChunk 流式响应块
@@ -57,6 +66,7 @@ type StreamingChunk struct {
 	Content          string          // 文本内容
 	ReasoningContent string          // 推理/思考内容（DeepSeek-R1 等推理模型）
 	ToolCalls        []ToolCallDelta // 完整的工具调用（流结束后填充）
+	Usage            *Usage          // API返回的token用量
 	Done             bool            // 流结束标志
 	Error            error           // 错误信息
 }

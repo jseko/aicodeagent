@@ -28,8 +28,10 @@ func NewBash(workingDir string) *Bash {
 	return &Bash{workingDir: workingDir}
 }
 
-func (b *Bash) Name() string        { return "bash" }
-func (b *Bash) Description() string { return "在终端中执行命令（受控沙箱，超时30秒）" }
+func (b *Bash) Name() string { return "bash" }
+func (b *Bash) Description() string {
+	return "在终端中执行命令（受控沙箱，超时30秒）"
+}
 func (b *Bash) Parameters() json.RawMessage {
 	schema := map[string]any{
 		"type": "object",

@@ -14,9 +14,9 @@ type mockTool struct {
 	execute     func(ctx context.Context, params json.RawMessage) (Result, error)
 }
 
-func (m *mockTool) Name() string                                { return m.name }
-func (m *mockTool) Description() string                         { return m.description }
-func (m *mockTool) Parameters() json.RawMessage                 { return m.params }
+func (m *mockTool) Name() string                { return m.name }
+func (m *mockTool) Description() string         { return m.description }
+func (m *mockTool) Parameters() json.RawMessage { return m.params }
 func (m *mockTool) Execute(ctx context.Context, p json.RawMessage) (Result, error) {
 	return m.execute(ctx, p)
 }

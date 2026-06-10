@@ -4,3 +4,4 @@ openspec/
 AICodeAgent
 aicodeagent.log
 .chat/
+.serena/

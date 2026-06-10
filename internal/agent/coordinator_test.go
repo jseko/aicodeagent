@@ -46,9 +46,9 @@ type testTool struct {
 	execute     func(ctx context.Context, params json.RawMessage) (tools.Result, error)
 }
 
-func (t *testTool) Name() string                          { return t.name }
-func (t *testTool) Description() string                   { return t.description }
-func (t *testTool) Parameters() json.RawMessage            { return json.RawMessage(`{}`) }
+func (t *testTool) Name() string                { return t.name }
+func (t *testTool) Description() string         { return t.description }
+func (t *testTool) Parameters() json.RawMessage { return json.RawMessage(`{}`) }
 func (t *testTool) Execute(ctx context.Context, p json.RawMessage) (tools.Result, error) {
 	return t.execute(ctx, p)
 }

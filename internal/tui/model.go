@@ -29,28 +29,92 @@ type Model struct {
 	currentAssistant *AssistantMessageItem
 	msgIDSeq         int
 
-	input      string
-	cursor     int
-	ready      bool
-	isLoading  bool
-	statusMsg  string
-	width      int
-	height     int
-	history    []string
-	historyIdx int
-	styles     *Styles
-	theme      *ThemeManager
+	input                string
+	slashSuggestionIndex int
+	cursor               int
+	ready                bool
+	isLoading            bool
+	cancelledCurrentTask bool
+	statusMsg            string
+	tokenStatus          string
+	tokenWarning         bool
+	width                int
+	height               int
+	history              []string
+	historyIdx           int
+	styles               *Styles
+	theme                *ThemeManager
 
 	// 动画状态
 	spinnerFrame int
 
 	// 滚动状态（智能滚动，例9-5）
-	scrollPos    int // 0=底部，正数=向上滚动行数
-	wasAtBottom  bool
+	scrollPos   int // 0=底部，正数=向上滚动行数
+	wasAtBottom bool
 }
 
 // SpinnerTickMsg 旋转动画定时消息
 type SpinnerTickMsg struct{}
+
+type slashCommand struct {
+	Name        string
+	Description string
+}
+
+var slashCommands = []slashCommand{
+	{Name: "/initialize", Description: "扫描项目并生成 AGENTS.md 预览"},
+	{Name: "/initialize-confirm", Description: "确认写入上一次生成的 AGENTS.md"},
+	{Name: "/initialize-reject", Description: "放弃上一次生成的 AGENTS.md"},
+	{Name: "/undo", Description: "回滚到上一条用户消息"},
+	{Name: "/redo", Description: "恢复被回滚的消息"},
+}
+
+func matchingSlashCommands(input string) []slashCommand {
+	if !strings.HasPrefix(input, "/") {
+		return nil
+	}
+	var matches []slashCommand
+	for _, command := range slashCommands {
+		if strings.HasPrefix(command.Name, input) {
+			matches = append(matches, command)
+		}
+	}
+	return matches
+}
+
+func clampSlashSuggestionIndex(input string, index int) int {
+	matches := matchingSlashCommands(input)
+	if len(matches) == 0 {
+		return 0
+	}
+	if index < 0 {
+		return len(matches) - 1
+	}
+	if index >= len(matches) {
+		return 0
+	}
+	return index
+}
+
+func completeSlashCommand(input string, index int) string {
+	matches := matchingSlashCommands(input)
+	if len(matches) == 0 {
+		return input
+	}
+	return matches[clampSlashSuggestionIndex(input, index)].Name
+}
+
+func formatTokenStatus(promptTokens, completionTokens, windowTokens int64, warning bool) string {
+	used := promptTokens + completionTokens
+	if windowTokens <= 0 || used <= 0 {
+		return ""
+	}
+	status := fmt.Sprintf("Token: %d / %d", used, windowTokens)
+	if warning {
+		status += " · 即将自动摘要"
+	}
+	return status
+}
 
 func New(a *app.App) Model {
 	theme := NewThemeManager()
@@ -127,7 +191,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.wasAtBottom = true
 			return m, nil
 
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
+			if m.isLoading {
+				m.pub.Publish(events.CancelTask{SessionID: m.sessionID, Time: time.Now()})
+				m.isLoading = false
+				m.cancelledCurrentTask = true
+				m.currentAssistant = nil
+				m.statusMsg = "已取消当前任务"
+				return m, nil
+			}
+			return m, tea.Quit
+		case tea.KeyEsc:
 			return m, tea.Quit
 		}
 
@@ -136,8 +210,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.Type {
+		case tea.KeyTab:
+			m.input = completeSlashCommand(m.input, m.slashSuggestionIndex)
+			m.slashSuggestionIndex = 0
+			return m, nil
+
 		case tea.KeyEnter:
 			if strings.TrimSpace(m.input) == "" {
+				return m, nil
+			}
+			if matches := matchingSlashCommands(m.input); len(matches) > 0 && m.input != matches[clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)].Name {
+				m.input = completeSlashCommand(m.input, m.slashSuggestionIndex)
+				m.slashSuggestionIndex = 0
 				return m, nil
 			}
 			content := m.input
@@ -152,6 +236,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, content)
 			m.historyIdx = len(m.history)
 			m.isLoading = true
+			m.cancelledCurrentTask = false
 			m.statusMsg = "Thinking..."
 			m.pub.Publish(events.UserMessage{
 				SessionID: m.sessionID,
@@ -165,22 +250,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(runes) > 0 {
 				m.input = string(runes[:len(runes)-1])
 			}
+			m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
 			return m, nil
 
 		case tea.KeyUp:
+			if len(matchingSlashCommands(m.input)) > 0 {
+				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex-1)
+				return m, nil
+			}
 			if len(m.history) > 0 && m.historyIdx > 0 {
 				m.historyIdx--
 				m.input = m.history[m.historyIdx]
+				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, 0)
 			}
 			return m, nil
 
 		case tea.KeyDown:
+			if len(matchingSlashCommands(m.input)) > 0 {
+				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex+1)
+				return m, nil
+			}
 			if m.historyIdx < len(m.history)-1 {
 				m.historyIdx++
 				m.input = m.history[m.historyIdx]
+				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, 0)
 			} else {
 				m.historyIdx = len(m.history)
 				m.input = ""
+				m.slashSuggestionIndex = 0
 			}
 			return m, nil
 
@@ -191,6 +288,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.input += string(r)
 			}
+			m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
 			return m, nil
 
 		default:
@@ -200,11 +298,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(runes) > 0 {
 					m.input = string(runes[:len(runes)-1])
 				}
+				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
 			}
 			return m, nil
 		}
 
 	case events.AgentThink:
+		if m.cancelledCurrentTask {
+			return m, nil
+		}
 		// 推理/思考内容：设置到当前助手消息的思考区
 		if msg.ReasoningContent != "" {
 			if m.currentAssistant == nil {
@@ -250,6 +352,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, spinnerTick()
 
 	case events.ToolCall:
+		if m.cancelledCurrentTask {
+			return m, nil
+		}
 		m.currentAssistant = nil
 		msgID := fmt.Sprintf("msg-%d", m.msgIDSeq)
 		m.msgIDSeq++
@@ -264,7 +369,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = "Running: " + msg.ToolName
 		return m, spinnerTick()
 
+	case events.SessionUpdate:
+		m.tokenStatus = formatTokenStatus(msg.PromptTokens, msg.CompletionTokens, msg.WindowTokens, msg.Warning)
+		m.tokenWarning = msg.Warning
+		return m, nil
+
 	case events.ToolResult:
+		if m.cancelledCurrentTask {
+			return m, nil
+		}
 		item := m.findPendingToolItem(msg.ToolName)
 		if item != nil {
 			if msg.Error != "" {
@@ -282,6 +395,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case events.ErrorEvent:
+		if m.cancelledCurrentTask {
+			return m, nil
+		}
 		m.isLoading = false
 		m.currentAssistant = nil
 		m.statusMsg = "Error: " + msg.Error
@@ -379,6 +495,44 @@ func (m Model) View() string {
 		b.WriteString("\n")
 		b.WriteString(statusStyle.Render(m.statusMsg))
 		b.WriteString("\n")
+	}
+	if m.tokenStatus != "" {
+		tokenStyle := lipgloss.NewStyle().
+			Foreground(s.FgMuted).
+			PaddingLeft(2)
+		if m.tokenWarning {
+			tokenStyle = tokenStyle.Foreground(s.Primary).Bold(true)
+		}
+		b.WriteString(tokenStyle.Render(m.tokenStatus))
+		b.WriteString("\n")
+	}
+
+	// 命令提示区
+	if !m.isLoading {
+		matches := matchingSlashCommands(m.input)
+		if len(matches) > 0 {
+			hintStyle := lipgloss.NewStyle().
+				Foreground(s.FgMuted).
+				PaddingLeft(2)
+			selectedStyle := lipgloss.NewStyle().
+				Foreground(s.Primary).
+				Bold(true)
+
+			b.WriteString("\n")
+			b.WriteString(hintStyle.Render("Slash commands:"))
+			b.WriteString("\n")
+			selected := clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+			for i, command := range matches {
+				line := fmt.Sprintf("  %s  %s", command.Name, command.Description)
+				if i == selected {
+					line += "  (Tab/Enter)"
+					b.WriteString(selectedStyle.Render(line))
+				} else {
+					b.WriteString(hintStyle.Render(line))
+				}
+				b.WriteString("\n")
+			}
+		}
 	}
 
 	// 输入区

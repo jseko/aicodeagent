@@ -10,11 +10,13 @@ import (
 type EventType string
 
 const (
-	TypeUserMessage EventType = "user.message"
-	TypeAgentThink  EventType = "agent.think"
-	TypeToolCall    EventType = "tool.call"
-	TypeToolResult  EventType = "tool.result"
-	TypeError       EventType = "error"
+	TypeUserMessage   EventType = "user.message"
+	TypeAgentThink    EventType = "agent.think"
+	TypeToolCall      EventType = "tool.call"
+	TypeToolResult    EventType = "tool.result"
+	TypeSessionUpdate EventType = "session.update"
+	TypeCancelTask    EventType = "task.cancel"
+	TypeError         EventType = "error"
 )
 
 // Event 基础事件接口
@@ -30,7 +32,7 @@ type UserMessage struct {
 	Time      time.Time `json:"time"`
 }
 
-func (e UserMessage) Type() EventType     { return TypeUserMessage }
+func (e UserMessage) Type() EventType      { return TypeUserMessage }
 func (e UserMessage) Timestamp() time.Time { return e.Time }
 
 // AgentThink AI 流式响应事件
@@ -43,7 +45,7 @@ type AgentThink struct {
 }
 
 func (e AgentThink) Type() EventType      { return TypeAgentThink }
-func (e AgentThink) Timestamp() time.Time  { return e.Time }
+func (e AgentThink) Timestamp() time.Time { return e.Time }
 
 // ToolCall 工具调用事件
 type ToolCall struct {
@@ -53,8 +55,8 @@ type ToolCall struct {
 	Time      time.Time       `json:"time"`
 }
 
-func (e ToolCall) Type() EventType       { return TypeToolCall }
-func (e ToolCall) Timestamp() time.Time   { return e.Time }
+func (e ToolCall) Type() EventType      { return TypeToolCall }
+func (e ToolCall) Timestamp() time.Time { return e.Time }
 
 // ToolResult 工具执行结果事件
 type ToolResult struct {
@@ -66,7 +68,30 @@ type ToolResult struct {
 }
 
 func (e ToolResult) Type() EventType      { return TypeToolResult }
-func (e ToolResult) Timestamp() time.Time  { return e.Time }
+func (e ToolResult) Timestamp() time.Time { return e.Time }
+
+// SessionUpdate 会话更新事件（Undo/Redo 等操作触发）
+type SessionUpdate struct {
+	SessionID        string    `json:"session_id"`
+	PromptTokens     int64     `json:"prompt_tokens"`
+	CompletionTokens int64     `json:"completion_tokens"`
+	WindowTokens     int64     `json:"window_tokens"`
+	ThresholdTokens  int64     `json:"threshold_tokens"`
+	Warning          bool      `json:"warning"`
+	Time             time.Time `json:"time"`
+}
+
+func (e SessionUpdate) Type() EventType      { return TypeSessionUpdate }
+func (e SessionUpdate) Timestamp() time.Time { return e.Time }
+
+// CancelTask 取消当前任务事件
+type CancelTask struct {
+	SessionID string    `json:"session_id"`
+	Time      time.Time `json:"time"`
+}
+
+func (e CancelTask) Type() EventType      { return TypeCancelTask }
+func (e CancelTask) Timestamp() time.Time { return e.Time }
 
 // ErrorEvent 错误事件
 type ErrorEvent struct {
@@ -76,4 +101,4 @@ type ErrorEvent struct {
 }
 
 func (e ErrorEvent) Type() EventType      { return TypeError }
-func (e ErrorEvent) Timestamp() time.Time  { return e.Time }
+func (e ErrorEvent) Timestamp() time.Time { return e.Time }

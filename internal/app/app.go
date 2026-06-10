@@ -19,10 +19,10 @@ import (
 
 // App 依赖注入容器，管理所有共享组件
 type App struct {
-	Ctx       context.Context
-	Cancel    context.CancelFunc
-	Config    *config.Config
-	Logger    *slog.Logger
+	Ctx    context.Context
+	Cancel context.CancelFunc
+	Config *config.Config
+	Logger *slog.Logger
 
 	Coordinator    agent.Coordinator
 	SessionService agent.SessionService
@@ -136,6 +136,8 @@ func (a *App) StartEventLoop(ctx context.Context) {
 				switch e := event.(type) {
 				case events.UserMessage:
 					a.Coordinator.HandleUserMessage(e)
+				case events.CancelTask:
+					a.Coordinator.Cancel(e.SessionID)
 				}
 			}
 		}
@@ -317,9 +319,15 @@ func (m *memoryMessageService) List(ctx context.Context, sessionID string) ([]ag
 func (m *memoryMessageService) Create(ctx context.Context, sessionID string, params agent.CreateMessageParams) (*agent.Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	messageID := params.ID
+	if messageID == "" {
+		messageID = fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	}
 	msg := &agent.Message{
-		Role:    params.Role,
-		Content: params.Content,
+		ID:               messageID,
+		Role:             params.Role,
+		Content:          params.Content,
+		IsSummaryMessage: params.IsSummaryMessage,
 	}
 	m.messages[sessionID] = append(m.messages[sessionID], *msg)
 	return msg, nil

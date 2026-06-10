@@ -24,24 +24,31 @@ const (
 
 // OpenAIRequest OpenAI API请求体
 type OpenAIRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream"`
-	Tools       []any     `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
-	MaxTokens   int64     `json:"max_tokens,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
+	Model         string               `json:"model"`
+	Messages      []Message            `json:"messages"`
+	Stream        bool                 `json:"stream"`
+	StreamOptions *OpenAIStreamOptions `json:"stream_options,omitempty"`
+	Tools         []any                `json:"tools,omitempty"`
+	ToolChoice    string               `json:"tool_choice,omitempty"`
+	MaxTokens     int64                `json:"max_tokens,omitempty"`
+	Temperature   float64              `json:"temperature,omitempty"`
+	TopP          float64              `json:"top_p,omitempty"`
+}
+
+type OpenAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // OpenAIStreamResponse SSE行解析结构
 type OpenAIStreamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content          string           `json:"content"`
-			ReasoningContent string           `json:"reasoning_content"`
-			ToolCalls        []toolCallDelta  `json:"tool_calls"`
+			Content          string          `json:"content"`
+			ReasoningContent string          `json:"reasoning_content"`
+			ToolCalls        []toolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *Usage `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
@@ -87,13 +94,15 @@ func (o *OpenAIProvider) Stream(ctx context.Context, call AgentStreamCall) (<-ch
 	}
 
 	reqBody, err := json.Marshal(OpenAIRequest{
-		Model:       o.model,
-		Messages:    messages,
-		Stream:      true,
-		Tools:       call.Tools,
-		ToolChoice:  "auto",
-		MaxTokens:   call.MaxTokens,
-		Temperature: call.Temperature,
+		Model:         o.model,
+		Messages:      messages,
+		Stream:        true,
+		StreamOptions: &OpenAIStreamOptions{IncludeUsage: true},
+		Tools:         call.Tools,
+		ToolChoice:    "auto",
+		MaxTokens:     call.MaxTokens,
+		Temperature:   call.Temperature,
+		TopP:          call.TopP,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -194,6 +203,10 @@ func (o *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, ch cha
 			continue
 		}
 
+		if resp.Usage != nil {
+			ch <- StreamingChunk{Usage: resp.Usage}
+		}
+
 		if len(resp.Choices) > 0 {
 			delta := resp.Choices[0].Delta
 
@@ -221,7 +234,11 @@ func (o *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, ch cha
 	}
 
 	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return // context 取消导致的 body close 属预期行为，不报错
+		}
 		ch <- StreamingChunk{Error: fmt.Errorf("scanner error: %w", err)}
+		return
 	}
 	// 流异常结束（未收到[DONE]），发送完成信号避免调用方永久阻塞
 	log.Printf("[OpenAI] SSE流异常结束（未收到[DONE]），发送合成完成信号")

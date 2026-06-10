@@ -27,8 +27,10 @@ func NewGrep(workingDir string) *Grep {
 	return &Grep{workingDir: workingDir}
 }
 
-func (g *Grep) Name() string        { return "grep" }
-func (g *Grep) Description() string { return "在文件中搜索指定模式（优先使用ripgrep，回退到grep）" }
+func (g *Grep) Name() string { return "grep" }
+func (g *Grep) Description() string {
+	return "在文件中搜索指定模式（优先使用ripgrep，回退到grep）"
+}
 func (g *Grep) Parameters() json.RawMessage {
 	schema := map[string]any{
 		"type": "object",

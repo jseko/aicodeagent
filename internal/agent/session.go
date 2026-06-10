@@ -26,16 +26,21 @@ const (
 
 // Session 会话数据模型
 type Session struct {
-	ID           string        `json:"id"`
-	Title        string        `json:"title"`
-	Status       SessionStatus `json:"status"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
-	ExpiresAt    time.Time     `json:"expires_at,omitempty"`
+	ID        string        `json:"id"`
+	Title     string        `json:"title"`
+	Status    SessionStatus `json:"status"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+	ExpiresAt time.Time     `json:"expires_at,omitempty"`
 
-	// Token统计
+	// 当前上下文 Token 统计，摘要压缩后可重置
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
+
+	// 累计账单 Token 统计，不随摘要压缩重置
+	TotalPromptTokens     int64   `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64   `json:"total_completion_tokens"`
+	TotalCost             float64 `json:"total_cost"`
 
 	// 总结消息ID
 	SummaryMessageID string `json:"summary_message_id,omitempty"`
@@ -45,6 +50,15 @@ type Session struct {
 
 	// 是否禁用自动总结
 	DisableAutoSummarize bool `json:"disable_auto_summarize"`
+
+	// Revert 回滚点（Undo时设置，Redo时清空）
+	Revert *RevertPoint `json:"revert,omitempty"`
+}
+
+// RevertPoint Undo/Redo 回滚点
+type RevertPoint struct {
+	MessageID string    `json:"message_id"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // SessionService 会话服务接口

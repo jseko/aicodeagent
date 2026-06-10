@@ -13,7 +13,7 @@ type AgentResult struct {
 	Session   *Session
 	Error     error
 	Stream    <-chan llm.StreamingChunk // 流式响应通道（非nil时表示流式输出）
-	ToolCalls []llm.ToolCallDelta      // LLM返回的工具调用（非空时需要执行后继续对话）
+	ToolCalls []llm.ToolCallDelta       // LLM返回的工具调用（非空时需要执行后继续对话）
 }
 
 // SessionAgent 会话代理接口
@@ -27,9 +27,9 @@ type SessionAgentCall struct {
 	Prompt      string
 	Session     *Session
 	Attachments []Attachment
-	Complexity  float64        // 任务复杂度评估(0-1)，0表示允许使用小模型
-	Tools       []any          // 工具定义（OpenAI function format），传给LLM
-	Messages    []llm.Message  // 对话历史（包含system prompt、历史消息、工具结果）
+	Complexity  float64       // 任务复杂度评估(0-1)，0表示允许使用小模型
+	Tools       []any         // 工具定义（OpenAI function format），传给LLM
+	Messages    []llm.Message // 对话历史（包含system prompt、历史消息、工具结果）
 }
 
 // Model LLM模型配置
@@ -41,7 +41,32 @@ type Model struct {
 
 // ModelConfig 模型配置参数
 type ModelConfig struct {
-	MaxTokens int64
-	APIKey    string
-	BaseURL   string
+	MaxTokens   int64
+	Temperature float64
+	TopP        float64
+	InputPer1M  float64
+	OutputPer1M float64
+	APIKey      string
+	BaseURL     string
+}
+
+type TokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+}
+
+type ModelPricing struct {
+	InputPer1M  float64
+	OutputPer1M float64
+}
+
+type CostConfig struct {
+	Pricing map[string]ModelPricing
+}
+
+type StopCondition struct {
+	Reason    string
+	Used      int64
+	Window    int64
+	Threshold int64
 }

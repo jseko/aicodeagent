@@ -24,8 +24,10 @@ func NewWrite(workingDir string) *Write {
 	return &Write{workingDir: workingDir}
 }
 
-func (w *Write) Name() string        { return "write" }
-func (w *Write) Description() string { return "写入文件内容（安全检查：路径沙箱 + 大小限制1MB）" }
+func (w *Write) Name() string { return "write" }
+func (w *Write) Description() string {
+	return "写入文件内容（安全检查：路径沙箱 + 大小限制1MB）"
+}
 func (w *Write) Parameters() json.RawMessage {
 	schema := map[string]any{
 		"type": "object",

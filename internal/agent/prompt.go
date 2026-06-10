@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"strings"
@@ -229,9 +230,9 @@ func DefaultWorkflow() Workflow {
 
 // preparePrompt 三层上下文构建：系统级→会话级→附件级
 func (a *sessionAgent) preparePrompt(msgs []Message) []llm.Message {
-	var history []llm.Message
+	history := make([]llm.Message, 0, len(msgs)+len(a.attachments)+1)
+	filtered := 0
 
-	// 1. 系统级：待办提醒（仅主Agent需要）
 	if !a.isSubAgent {
 		reminder := a.buildTodoReminder()
 		if reminder != "" {
@@ -241,22 +242,48 @@ func (a *sessionAgent) preparePrompt(msgs []Message) []llm.Message {
 		}
 	}
 
-	// 2. 会话级：智能过滤历史消息
-	for _, m := range msgs {
-		if m.ShouldInclude() {
-			history = append(history, llm.Message{
-				Role:    string(m.Role),
-				Content: m.Content,
-			})
+	for i := range msgs {
+		msg := &msgs[i]
+		if !msg.ShouldInclude() {
+			filtered++
 		}
 	}
+	history = append(history, a.buildContext("", nil, msgs)...)
+	if len(msgs) > 0 && filtered > 0 {
+		saved := float64(filtered) / float64(len(msgs)) * 100
+		log.Printf("[SessionAgent] filtered %d/%d messages, saved ~%.0f%% tokens", filtered, len(msgs), saved)
+	}
 
-	// 3. 附件级：文件内容
 	for _, att := range a.attachments {
 		history = append(history, llm.NewFileMessage(att.Content))
 	}
 
 	return history
+}
+
+func (a *sessionAgent) buildContext(systemPrompt string, session *Session, messages []Message) []llm.Message {
+	contextMessages := make([]llm.Message, 0, len(messages)+1)
+	if strings.TrimSpace(systemPrompt) != "" {
+		contextMessages = append(contextMessages, llm.NewSystemMessage(systemPrompt))
+	}
+
+	summaryID := ""
+	if session != nil {
+		summaryID = session.SummaryMessageID
+	}
+	for i := range messages {
+		msg := &messages[i]
+		if msg.IsSummaryMessage {
+			if msg.ID == summaryID {
+				contextMessages = append(contextMessages, msg.ToLLMMessage())
+			}
+			continue
+		}
+		if msg.ShouldInclude() {
+			contextMessages = append(contextMessages, msg.ToLLMMessage())
+		}
+	}
+	return contextMessages
 }
 
 // buildTodoReminder 构建待办提醒
@@ -279,13 +306,24 @@ type Attachment struct {
 
 // Message 代理层消息类型（与llm.Message对应）
 type Message struct {
-	Role       MessageRole
-	Content    string
-	ToolCallID string // 工具调用ID，用于关联tool消息与请求
+	ID               string
+	Role             MessageRole
+	Content          string
+	ToolCallID       string // 工具调用ID，用于关联tool消息与请求
+	Status           MessageStatus
+	IsSummaryMessage bool
 }
 
 // MessageRole 消息角色
 type MessageRole string
+
+// MessageStatus 消息状态
+type MessageStatus string
+
+const (
+	MessageStatusCompleted MessageStatus = "completed"
+	MessageStatusCancelled MessageStatus = "cancelled"
+)
 
 const (
 	RoleUser      MessageRole = "user"
@@ -296,6 +334,24 @@ const (
 
 // ShouldInclude 判断消息是否应包含在上下文中
 func (m *Message) ShouldInclude() bool {
-	// 过滤系统消息，减少不必要的token消耗
-	return m.Role != RoleSystem
+	if m == nil {
+		return false
+	}
+	if strings.TrimSpace(m.Content) == "" && m.ToolCallID == "" {
+		return false
+	}
+	if m.Role == RoleAssistant && m.Status == MessageStatusCancelled {
+		return false
+	}
+	return true
+}
+
+func (m *Message) ToLLMMessage() llm.Message {
+	return llm.Message{
+		Role:             string(m.Role),
+		Content:          m.Content,
+		ToolCallID:       m.ToolCallID,
+		ID:               m.ID,
+		IsSummaryMessage: m.IsSummaryMessage,
+	}
 }

@@ -9,16 +9,18 @@ import (
 )
 
 type Config struct {
-	Theme         string                 `yaml:"theme"`
-	OpenAI        OpenAI                 `yaml:"openai"`
-	SkillsPaths   []string               `yaml:"skills_paths"`
-	LogLevel      string                 `yaml:"log_level"`
-	Agent         AgentConfig            `yaml:"agent"`
-	Providers     []ProviderConfig       `yaml:"providers"`
-	Session       SessionConfig          `yaml:"session"`
-	Permission    PermissionConfig       `yaml:"permission"`
-	SummaryPrompt string                 `yaml:"summary_prompt"`
-	MCP           map[string]MCPConfig   `yaml:"mcp"`
+	Theme         string               `yaml:"theme"`
+	OpenAI        OpenAI               `yaml:"openai"`
+	SkillsPaths   []string             `yaml:"skills_paths"`
+	LogLevel      string               `yaml:"log_level"`
+	Agent         AgentConfig          `yaml:"agent"`
+	Providers     []ProviderConfig     `yaml:"providers"`
+	Models        ModelsConfig         `yaml:"models"`
+	Context       ContextConfig        `yaml:"context"`
+	Session       SessionConfig        `yaml:"session"`
+	Permission    PermissionConfig     `yaml:"permission"`
+	SummaryPrompt string               `yaml:"summary_prompt"`
+	MCP           map[string]MCPConfig `yaml:"mcp"`
 }
 
 type OpenAI struct {
@@ -28,13 +30,43 @@ type OpenAI struct {
 }
 
 type AgentConfig struct {
-	LargeModel  SelectedModel `yaml:"large_model"`
-	SmallModel  SelectedModel `yaml:"small_model"`
+	LargeModel SelectedModel `yaml:"large_model"`
+	SmallModel SelectedModel `yaml:"small_model"`
 }
 
 type SelectedModel struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"`
+}
+
+type ModelsConfig struct {
+	Default   string                 `yaml:"default"`
+	Scenarios ModelScenarios         `yaml:"scenarios"`
+	Items     map[string]ModelConfig `yaml:"items"`
+}
+
+type ModelScenarios struct {
+	Chat       string `yaml:"chat"`
+	Summarize  string `yaml:"summarize"`
+	Initialize string `yaml:"initialize"`
+}
+
+type ModelConfig struct {
+	Provider    string  `yaml:"provider"`
+	Model       string  `yaml:"model"`
+	Temperature float64 `yaml:"temperature"`
+	TopP        float64 `yaml:"top_p"`
+	MaxTokens   int64   `yaml:"max_tokens"`
+	InputPer1M  float64 `yaml:"input_per_1m"`
+	OutputPer1M float64 `yaml:"output_per_1m"`
+}
+
+type ContextConfig struct {
+	WindowTokens      int64   `yaml:"window_tokens"`
+	LargeWindowBuffer int64   `yaml:"large_window_buffer"`
+	SmallWindowRatio  float64 `yaml:"small_window_ratio"`
+	SummaryModel      string  `yaml:"summary_model"`
+	MemoryMaxBytes    int64   `yaml:"memory_max_bytes"`
 }
 
 type ProviderConfig struct {
@@ -51,8 +83,8 @@ type SessionConfig struct {
 
 type PermissionConfig struct {
 	DefaultLevel  int      `yaml:"default_level"`
-	FileWhitelist  []string `yaml:"file_whitelist"`
-	CmdWhitelist   []string `yaml:"cmd_whitelist"`
+	FileWhitelist []string `yaml:"file_whitelist"`
+	CmdWhitelist  []string `yaml:"cmd_whitelist"`
 }
 
 // MCPConfig MCP 服务器连接配置
@@ -89,8 +121,33 @@ func Load(path string) (*Config, error) {
 			LargeModel: SelectedModel{Provider: "openai", Model: "gpt-4o"},
 			SmallModel: SelectedModel{Provider: "openai", Model: "gpt-4o-mini"},
 		},
-		Session:    SessionConfig{IdleTimeout: "30m", MaxSessions: 10},
-		Permission: PermissionConfig{DefaultLevel: 1},
+		Models: ModelsConfig{
+			Default: "gpt-4o",
+			Scenarios: ModelScenarios{
+				Chat:       "gpt-4o",
+				Summarize:  "gpt-4o-mini",
+				Initialize: "gpt-4o-mini",
+			},
+			Items: map[string]ModelConfig{
+				"gpt-4o": {
+					Provider: "openai", Model: "gpt-4o",
+					Temperature: 0.7, TopP: 1.0, MaxTokens: 4096,
+				},
+				"gpt-4o-mini": {
+					Provider: "openai", Model: "gpt-4o-mini",
+					Temperature: 0.3, TopP: 1.0, MaxTokens: 2048,
+				},
+			},
+		},
+		Context: ContextConfig{
+			WindowTokens:      128000,
+			LargeWindowBuffer: 20000,
+			SmallWindowRatio:  0.2,
+			SummaryModel:      "gpt-4o-mini",
+			MemoryMaxBytes:    100 * 1024,
+		},
+		Session:       SessionConfig{IdleTimeout: "30m", MaxSessions: 10},
+		Permission:    PermissionConfig{DefaultLevel: 1},
 		SummaryPrompt: "请用简洁的语言总结以下对话的关键要点，保留所有技术细节。",
 	}
 
@@ -118,4 +175,57 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("配置校验失败: log_level 不能为空")
 	}
 	return nil
+}
+
+func (c *Config) GetModelConfig(id string) (ModelConfig, bool) {
+	if id == "" {
+		id = c.Models.Default
+	}
+	if c.Models.Items == nil {
+		return ModelConfig{}, false
+	}
+	model, ok := c.Models.Items[id]
+	if !ok {
+		return ModelConfig{}, false
+	}
+	return c.normalizeModelConfig(id, model), true
+}
+
+func (c *Config) normalizeModelConfig(id string, model ModelConfig) ModelConfig {
+	if model.Model == "" {
+		model.Model = id
+	}
+	if model.Provider == "" {
+		model.Provider = "openai"
+	}
+	if model.Temperature == 0 {
+		model.Temperature = c.OpenAI.Temperature
+	}
+	if model.TopP == 0 {
+		model.TopP = 1.0
+	}
+	if model.MaxTokens == 0 {
+		model.MaxTokens = 4096
+	}
+	return model
+}
+
+func (c *Config) ModelForScenario(scenario string) (string, ModelConfig, bool) {
+	id := c.Models.Default
+	switch scenario {
+	case "chat":
+		if c.Models.Scenarios.Chat != "" {
+			id = c.Models.Scenarios.Chat
+		}
+	case "summarize":
+		if c.Models.Scenarios.Summarize != "" {
+			id = c.Models.Scenarios.Summarize
+		}
+	case "initialize":
+		if c.Models.Scenarios.Initialize != "" {
+			id = c.Models.Scenarios.Initialize
+		}
+	}
+	model, ok := c.GetModelConfig(id)
+	return id, model, ok
 }

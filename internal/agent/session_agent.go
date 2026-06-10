@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 
 	"AICodeAgent/internal/llm"
@@ -11,16 +12,16 @@ import (
 
 // 复杂度估算阈值常量
 const (
-	smallModelThreshold  = 0.3  // 小模型选择阈值
-	maxComplexity        = 1.0  // 复杂度上限
-	shortPromptLen       = 50   // 短prompt字符数
-	mediumPromptLen      = 200  // 中等prompt字符数
-	shortPromptScore     = 0.0  // 短prompt分数
-	mediumPromptScore    = 0.2  // 中等prompt分数
-	longPromptScore      = 0.4  // 长prompt分数
-	historyLenThreshold  = 10   // 历史消息数量阈值
-	longHistoryScore     = 0.3  // 长历史分数加成
-	defaultTemperature   = 0.7  // 默认温度参数
+	smallModelThreshold = 0.3 // 小模型选择阈值
+	maxComplexity       = 1.0 // 复杂度上限
+	shortPromptLen      = 50  // 短prompt字符数
+	mediumPromptLen     = 200 // 中等prompt字符数
+	shortPromptScore    = 0.0 // 短prompt分数
+	mediumPromptScore   = 0.2 // 中等prompt分数
+	longPromptScore     = 0.4 // 长prompt分数
+	historyLenThreshold = 10  // 历史消息数量阈值
+	longHistoryScore    = 0.3 // 长历史分数加成
+	defaultTemperature  = 0.7 // 默认温度参数
 )
 
 // sessionAgent 双模型会话代理（实现SessionAgent接口）
@@ -106,11 +107,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 	defer provider.Close()
 
 	// 3. 流式调用LLM（带工具定义）
+	temperature := model.Config.Temperature
+	if temperature == 0 {
+		temperature = a.temperature
+	}
+	if temperature == 0 {
+		temperature = defaultTemperature
+	}
+	filteredMessages := a.buildMessages("", call)
 	streamCall := llm.AgentStreamCall{
 		Prompt:      call.Prompt,
-		Messages:    call.Messages,
+		Messages:    filteredMessages,
 		Tools:       call.Tools,
-		Temperature: a.temperature,
+		MaxTokens:   model.Config.MaxTokens,
+		Temperature: temperature,
+		TopP:        model.Config.TopP,
 	}
 	log.Printf("[SessionAgent] 调用LLM（工具数=%d, 历史消息数=%d）", len(call.Tools), len(call.Messages))
 	ch, err := provider.Stream(ctx, streamCall)
@@ -130,6 +141,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 		}
 		if chunk.Done {
 			break
+		}
+		if chunk.Usage != nil && call.Session != nil {
+			a.updateSessionUsage(model, call.Session, chunk.Usage)
 		}
 		if len(chunk.ToolCalls) > 0 {
 			toolCalls = chunk.ToolCalls
@@ -154,6 +168,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*AgentRe
 	}, nil
 }
 
+func (a *sessionAgent) updateSessionUsage(model *Model, session *Session, usage *llm.Usage) {
+	if session == nil || usage == nil {
+		return
+	}
+	session.PromptTokens += usage.PromptTokens
+	session.CompletionTokens += usage.CompletionTokens
+	session.TotalPromptTokens += usage.PromptTokens
+	session.TotalCompletionTokens += usage.CompletionTokens
+	session.TotalCost += calculateUsageCost(model, usage)
+}
+
+func calculateUsageCost(model *Model, usage *llm.Usage) float64 {
+	if model == nil || usage == nil {
+		return 0
+	}
+	inputCost := float64(usage.PromptTokens) * model.Config.InputPer1M / 1_000_000
+	outputCost := float64(usage.CompletionTokens) * model.Config.OutputPer1M / 1_000_000
+	return inputCost + outputCost
+}
+
 // buildProvider 根据模型配置构建对应的Provider实例
 func (a *sessionAgent) buildProvider(model *Model) (llm.Provider, error) {
 	return BuildProvider(model)
@@ -175,12 +209,21 @@ func BuildProvider(model *Model) (llm.Provider, error) {
 }
 
 // buildMessages 构建发送给LLM的消息列表
-func (a *sessionAgent) buildMessages(systemPrompt string, call SessionAgentCall) []llm.Message {
-	var msgs []llm.Message
-
-	if systemPrompt != "" {
-		msgs = append(msgs, llm.NewSystemMessage(systemPrompt))
+func (a *sessionAgent) buildMessages(_ string, call SessionAgentCall) []llm.Message {
+	summaryID := ""
+	if call.Session != nil {
+		summaryID = call.Session.SummaryMessageID
 	}
 
+	msgs := make([]llm.Message, 0, len(call.Messages))
+	for _, msg := range call.Messages {
+		if summaryID != "" && msg.IsSummaryMessage && msg.ID != summaryID {
+			continue
+		}
+		if msg.Role == "" && strings.TrimSpace(msg.Content) == "" && msg.ToolCallID == "" {
+			continue
+		}
+		msgs = append(msgs, msg)
+	}
 	return msgs
 }
