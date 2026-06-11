@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -217,6 +219,80 @@ func TestClientSessionPing(t *testing.T) {
 	err = session.Ping(ctx)
 	if err != nil {
 		t.Fatalf("Ping failed: %v", err)
+	}
+}
+
+func TestCreateTransportDispatchesByType(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  MCPConfigAdapter
+		want any
+	}{
+		{name: "stdio", cfg: MCPConfigAdapter{Type: string(MCPTransportStdio), Command: "go", Args: []string{"version"}}, want: (*CommandTransport)(nil)},
+		{name: "http", cfg: MCPConfigAdapter{Type: string(MCPTransportHTTP), URL: "http://example.com/mcp"}, want: (*HTTPTransport)(nil)},
+		{name: "sse", cfg: MCPConfigAdapter{Type: string(MCPTransportSSE), URL: "http://example.com/sse"}, want: (*SSETransport)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, err := createTransport(context.Background(), tt.cfg)
+			if err != nil {
+				t.Fatalf("createTransport failed: %v", err)
+			}
+			defer tr.Close()
+			switch tt.want.(type) {
+			case *CommandTransport:
+				if _, ok := tr.(*CommandTransport); !ok {
+					t.Fatalf("expected CommandTransport, got %T", tr)
+				}
+			case *HTTPTransport:
+				if _, ok := tr.(*HTTPTransport); !ok {
+					t.Fatalf("expected HTTPTransport, got %T", tr)
+				}
+			case *SSETransport:
+				if _, ok := tr.(*SSETransport); !ok {
+					t.Fatalf("expected SSETransport, got %T", tr)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateTransportRejectsUnknownType(t *testing.T) {
+	_, err := createTransport(context.Background(), MCPConfigAdapter{Type: "websocket"})
+	if err == nil {
+		t.Fatal("expected unsupported type error")
+	}
+	if err.Error() != "unsupported transport type: websocket" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCreateSessionUsesStreamableHTTPTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentTypeJSON)
+		var req JSONRPCMessage
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Method == "initialize" {
+			resp := buildInitResponse(1)
+			_, _ = w.Write(resp)
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{}}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	session, err := createSession(ctx, "remote", MCPConfigAdapter{Type: string(MCPTransportHTTP), URL: server.URL, Timeout: 1})
+	if err != nil {
+		t.Fatalf("createSession failed: %v", err)
+	}
+	defer session.Close()
+	if _, ok := session.transport.(*HTTPTransport); !ok {
+		t.Fatalf("expected HTTPTransport, got %T", session.transport)
 	}
 }
 

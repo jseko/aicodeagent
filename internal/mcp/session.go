@@ -52,9 +52,9 @@ type ServerCapabilities struct {
 
 // Tool MCP 工具定义
 type Tool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema any `json:"inputSchema"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	InputSchema any    `json:"inputSchema"`
 }
 
 // ListToolsResult tools/list 响应结果
@@ -182,17 +182,7 @@ func (s *ClientSession) Close() error {
 
 // createSession 创建 MCP 会话（封装 Transport 创建和 Initialize 流程）
 func createSession(ctx context.Context, _ string, cfg MCPConfigAdapter) (*ClientSession, error) {
-	var transport Transport
-	var err error
-
-	switch cfg.Type {
-	case "stdio":
-		transport, err = createStdioTransport(ctx, cfg)
-	case "http":
-		transport, err = createHTTPTransport(ctx, cfg)
-	default:
-		return nil, fmt.Errorf("unsupported transport type: %s", cfg.Type)
-	}
+	transport, err := createTransport(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +201,19 @@ func createSession(ctx context.Context, _ string, cfg MCPConfigAdapter) (*Client
 		return nil, err
 	}
 	return session, nil
+}
+
+func createTransport(ctx context.Context, cfg MCPConfigAdapter) (Transport, error) {
+	switch MCPTransportType(cfg.Type) {
+	case MCPTransportStdio:
+		return createStdioTransport(ctx, cfg)
+	case MCPTransportHTTP:
+		return createHTTPTransport(ctx, cfg)
+	case MCPTransportSSE:
+		return createSSETransport(ctx, cfg)
+	default:
+		return nil, fmt.Errorf("unsupported transport type: %s", cfg.Type)
+	}
 }
 
 // MCPConfigAdapter Transport 创建所需的配置适配器
@@ -240,10 +243,19 @@ func createStdioTransport(ctx context.Context, cfg MCPConfigAdapter) (Transport,
 }
 
 func createHTTPTransport(_ context.Context, cfg MCPConfigAdapter) (Transport, error) {
-	// 解析 header value 中的环境变量引用（如 ${GITHUB_TOKEN}）
-	resolvedHeaders := make(map[string]string, len(cfg.Headers))
-	for k, v := range cfg.Headers {
-		resolvedHeaders[k] = resolveEnvVars(v)
-	}
+	resolvedHeaders := resolveHeaders(cfg.Headers)
 	return NewHTTPTransport(cfg.URL, resolvedHeaders), nil
+}
+
+func createSSETransport(_ context.Context, cfg MCPConfigAdapter) (Transport, error) {
+	resolvedHeaders := resolveHeaders(cfg.Headers)
+	return NewSSETransport(cfg.URL, resolvedHeaders), nil
+}
+
+func resolveHeaders(headers map[string]string) map[string]string {
+	resolved := make(map[string]string, len(headers))
+	for k, v := range headers {
+		resolved[k] = resolveEnvVars(v)
+	}
+	return resolved
 }
