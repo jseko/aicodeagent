@@ -44,6 +44,8 @@ func (e *MultiLineEditor) Update(msg tea.Msg) (Component, tea.Cmd) {
 	}
 
 	switch {
+	case k.Type == tea.KeySpace:
+		e.insertText(" ")
 	case k.Type == tea.KeyRunes:
 		e.insertText(string(k.Runes))
 	case k.Type == tea.KeyEnter && k.Alt:

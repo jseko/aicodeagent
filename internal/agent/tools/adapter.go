@@ -32,8 +32,30 @@ func (c *ToolCaller) ResolveAndCheck(toolName string, params json.RawMessage) (T
 	if !ok {
 		return nil, false, false, fmt.Sprintf("未知工具: %s", toolName)
 	}
+	if isAllowedSkillRead(toolName, tool, params) {
+		return tool, true, false, ""
+	}
 	allow, needConfirm, reason := c.permService.Check(toolName, params)
 	return tool, allow, needConfirm, reason
+}
+
+type skillReadAuthorizer interface {
+	AllowsSkillRead(filePath string) bool
+}
+
+func isAllowedSkillRead(toolName string, tool Tool, params json.RawMessage) bool {
+	if toolName != "view" {
+		return false
+	}
+	authorizer, ok := tool.(skillReadAuthorizer)
+	if !ok {
+		return false
+	}
+	var viewParams ViewParams
+	if err := json.Unmarshal(params, &viewParams); err != nil {
+		return false
+	}
+	return authorizer.AllowsSkillRead(viewParams.FilePath)
 }
 
 // CallTool 串联执行全流程：精确查找→权限检查→超时执行

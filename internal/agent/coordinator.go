@@ -20,6 +20,7 @@ import (
 	"AICodeAgent/internal/llm"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
+	"AICodeAgent/internal/skills"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -58,6 +59,8 @@ type coordinator struct {
 	mu           sync.RWMutex
 	permService  *permission.PermissionService
 	broker       pubsub.Publisher[events.Event]
+	skills       *skills.Manager
+	matcher      *SkillMatcher
 	confirmFn    func(toolName, arguments string) bool // 可注入的确认回调，测试用
 	pendingInit  *initializeResult                     // 待确认的 /initialize 结果
 }
@@ -84,6 +87,32 @@ type ToolCall struct {
 	Function FunctionCall
 }
 
+type viewToolParams struct {
+	FilePath string `json:"file_path"`
+}
+
+func skillNameFromToolCall(toolName string, arguments string) string {
+	if toolName != "view" {
+		return ""
+	}
+	var params viewToolParams
+	if err := json.Unmarshal([]byte(arguments), &params); err != nil {
+		return ""
+	}
+	return skillNameFromPath(params.FilePath)
+}
+
+func skillNameFromPath(path string) string {
+	if path == "" || filepath.Base(path) != skills.SkillFileName {
+		return ""
+	}
+	name := filepath.Base(filepath.Dir(path))
+	if name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	return name
+}
+
 // FunctionCall 函数调用详情
 type FunctionCall struct {
 	Name      string
@@ -101,6 +130,7 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 		tools:       toolRegistry,
 		permService: permService,
 		broker:      broker,
+		skills:      skills.NewManager("."),
 		running:     make(map[string]context.CancelFunc),
 		sessionIDs:  make(map[string]string),
 	}
@@ -222,6 +252,8 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 		}
 	}
 
+	availableSkillsXML := c.loadAvailableSkills(envInfo.WorkingDir)
+
 	builder := prompt.NewPromptBuilder().
 		WithSystem("AICodeAgent", "一个运行在终端的AI编程助手", ruleStrings(DefaultRules())).
 		WithEnvironmentInfo(prompt.EnvironmentInfo{
@@ -231,6 +263,7 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 			Date:       envInfo.Date,
 		}).
 		WithTools(convertToPromptTools(c.collectToolDescriptions())).
+		WithSkills(availableSkillsXML).
 		WithProjectContext(projectContent)
 
 	systemPrompt, err := builder.Build()
@@ -251,6 +284,28 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 	agent.smallSystemPrompt = smallPrompt
 	agent.temperature = c.config.OpenAI.Temperature
 	log.Println("[Coordinator] 系统提示词加载完成")
+}
+
+func (c *coordinator) loadAvailableSkills(projectDir string) string {
+	if c.skills == nil {
+		return ""
+	}
+
+	c.skills = skills.NewManager(projectDir)
+	paths := skills.DefaultPaths(projectDir)
+	paths = append(paths, skills.ResolvePaths(c.config.SkillsPaths, projectDir)...)
+	if len(paths) == 0 {
+		c.matcher = nil
+		return ""
+	}
+	if err := c.skills.Load(paths); err != nil {
+		log.Printf("[Coordinator] 技能加载失败: %v", err)
+		c.matcher = nil
+		return ""
+	}
+	skillList := c.skills.List()
+	c.matcher = NewSkillMatcher(skillList)
+	return skills.ToPromptXML(skillList)
 }
 
 // ruleStrings 将 Rule 切片转换为字符串切片
@@ -436,10 +491,12 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 			// 发布工具调用事件到UI
 			for _, tc := range result.ToolCalls {
 				log.Printf("[Coordinator] 工具: %s(%s)", tc.Function.Name, tc.Function.Arguments)
+				skillName := skillNameFromToolCall(tc.Function.Name, tc.Function.Arguments)
 				c.broker.PublishMustDeliver(runCtx, events.ToolCall{
 					SessionID: session.ID,
 					ToolName:  tc.Function.Name,
 					Params:    json.RawMessage(tc.Function.Arguments),
+					SkillName: skillName,
 					Time:      time.Now(),
 				})
 			}
@@ -451,12 +508,15 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 			// 发布工具结果事件（关联工具名）
 			for idx, tr := range toolResults {
 				toolName := ""
+				skillName := ""
 				if idx < len(agentToolCalls) {
 					toolName = agentToolCalls[idx].Function.Name
+					skillName = skillNameFromToolCall(toolName, agentToolCalls[idx].Function.Arguments)
 				}
 				c.broker.PublishMustDeliver(runCtx, events.ToolResult{
 					SessionID: session.ID,
 					ToolName:  toolName,
+					SkillName: skillName,
 					Result:    tr.Content,
 					Time:      time.Now(),
 				})
@@ -673,9 +733,10 @@ func (c *coordinator) detectToolCall(chunk llm.StreamingChunk) *events.ToolCall 
 	}
 	tc := chunk.ToolCalls[0]
 	return &events.ToolCall{
-		ToolName: tc.Function.Name,
-		Params:   json.RawMessage(tc.Function.Arguments),
-		Time:     time.Now(),
+		ToolName:  tc.Function.Name,
+		Params:    json.RawMessage(tc.Function.Arguments),
+		SkillName: skillNameFromToolCall(tc.Function.Name, tc.Function.Arguments),
+		Time:      time.Now(),
 	}
 }
 

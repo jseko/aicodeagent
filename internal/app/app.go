@@ -15,6 +15,7 @@ import (
 	"AICodeAgent/internal/mcp"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
+	"AICodeAgent/internal/skills"
 )
 
 // App 依赖注入容器，管理所有共享组件
@@ -24,11 +25,12 @@ type App struct {
 	Config *config.Config
 	Logger *slog.Logger
 
-	Coordinator    agent.Coordinator
-	SessionService agent.SessionService
-	ToolRegistry   *tools.Registry
-	PermService    *permission.PermissionService
-	Broker         *pubsub.Broker[events.Event]
+	Coordinator      agent.Coordinator
+	SessionService   agent.SessionService
+	ToolRegistry     *tools.Registry
+	PermService      *permission.PermissionService
+	Broker           *pubsub.Broker[events.Event]
+	SkillSuggestions []skills.SkillSuggestion
 }
 
 // New 创建 App 实例并初始化所有组件
@@ -57,7 +59,7 @@ func New(ctx context.Context, cfg *config.Config) *App {
 
 	// 初始化工具注册表
 	toolRegistry := tools.NewRegistry()
-	registerDefaultTools(toolRegistry)
+	registerDefaultTools(toolRegistry, cfg)
 
 	// 初始化权限服务
 	permLevel := permission.PermLevel(cfg.Permission.DefaultLevel)
@@ -88,16 +90,27 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		broker,
 	)
 
+	skillManager := skills.NewManager(".")
+	skillPaths := skills.DefaultPaths(".")
+	if cfg != nil {
+		skillPaths = append(skillPaths, skills.ResolvePaths(cfg.SkillsPaths, ".")...)
+	}
+	if err := skillManager.Load(skillPaths); err != nil {
+		logger.Warn("加载技能提示失败", "error", err)
+	}
+	skillSuggestions := skills.NewSkillSuggestions(skillManager.List())
+
 	app := &App{
-		Ctx:            appCtx,
-		Cancel:         cancel,
-		Config:         cfg,
-		Logger:         logger,
-		Coordinator:    coordinator,
-		SessionService: sessionService,
-		ToolRegistry:   toolRegistry,
-		PermService:    permService,
-		Broker:         broker,
+		Ctx:              appCtx,
+		Cancel:           cancel,
+		Config:           cfg,
+		Logger:           logger,
+		Coordinator:      coordinator,
+		SessionService:   sessionService,
+		ToolRegistry:     toolRegistry,
+		PermService:      permService,
+		Broker:           broker,
+		SkillSuggestions: skillSuggestions,
 	}
 
 	// 后台初始化 MCP 工具
@@ -180,8 +193,13 @@ func (a *App) initMCP() {
 }
 
 // registerDefaultTools 注册默认工具
-func registerDefaultTools(registry *tools.Registry) {
-	registry.Register(tools.NewView("."))
+func registerDefaultTools(registry *tools.Registry, cfg *config.Config) {
+	skillRoots := skills.DefaultPaths(".")
+	if cfg != nil {
+		skillRoots = append(skillRoots, skills.ResolvePaths(cfg.SkillsPaths, ".")...)
+	}
+
+	registry.Register(tools.NewView(".").WithSkillRoots(skillRoots))
 	registry.Register(tools.NewBash("."))
 	registry.Register(tools.NewWrite("."))
 	registry.Register(tools.NewGrep("."))

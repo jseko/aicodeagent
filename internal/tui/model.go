@@ -13,6 +13,7 @@ import (
 	"AICodeAgent/internal/app"
 	"AICodeAgent/internal/events"
 	"AICodeAgent/internal/pubsub"
+	"AICodeAgent/internal/skills"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -25,25 +26,28 @@ type Model struct {
 	sessionID string
 
 	// 消息渲染 — 使用 MessageItem 接口实现富文本渲染
-	messageItems     []MessageItem
-	currentAssistant *AssistantMessageItem
-	msgIDSeq         int
+	messageItems      []MessageItem
+	currentAssistant  *AssistantMessageItem
+	selectedToolIndex int
+	msgIDSeq          int
 
-	input                string
-	slashSuggestionIndex int
-	cursor               int
-	ready                bool
-	isLoading            bool
-	cancelledCurrentTask bool
-	statusMsg            string
-	tokenStatus          string
-	tokenWarning         bool
-	width                int
-	height               int
-	history              []string
-	historyIdx           int
-	styles               *Styles
-	theme                *ThemeManager
+	input                  string
+	slashSuggestionIndex   int
+	slashSuggestionsHidden bool
+	skillSuggestions       []skills.SkillSuggestion
+	cursor                 int
+	ready                  bool
+	isLoading              bool
+	cancelledCurrentTask   bool
+	statusMsg              string
+	tokenStatus            string
+	tokenWarning           bool
+	width                  int
+	height                 int
+	history                []string
+	historyIdx             int
+	styles                 *Styles
+	theme                  *ThemeManager
 
 	// 动画状态
 	spinnerFrame int
@@ -56,34 +60,66 @@ type Model struct {
 // SpinnerTickMsg 旋转动画定时消息
 type SpinnerTickMsg struct{}
 
-type slashCommand struct {
-	Name        string
+const maxVisibleSlashSuggestions = 8
+
+type slashSuggestion struct {
+	Command     string
 	Description string
+	Skill       bool
 }
 
-var slashCommands = []slashCommand{
-	{Name: "/initialize", Description: "扫描项目并生成 AGENTS.md 预览"},
-	{Name: "/initialize-confirm", Description: "确认写入上一次生成的 AGENTS.md"},
-	{Name: "/initialize-reject", Description: "放弃上一次生成的 AGENTS.md"},
-	{Name: "/undo", Description: "回滚到上一条用户消息"},
-	{Name: "/redo", Description: "恢复被回滚的消息"},
+var builtInSlashSuggestions = []slashSuggestion{
+	{Command: "/initialize", Description: "扫描项目并生成 AGENTS.md 预览"},
+	{Command: "/initialize-confirm", Description: "确认写入上一次生成的 AGENTS.md"},
+	{Command: "/initialize-reject", Description: "放弃上一次生成的 AGENTS.md"},
+	{Command: "/undo", Description: "回滚到上一条用户消息"},
+	{Command: "/redo", Description: "恢复被回滚的消息"},
 }
 
-func matchingSlashCommands(input string) []slashCommand {
-	if !strings.HasPrefix(input, "/") {
+func (m Model) matchingSlashSuggestions(input string) []slashSuggestion {
+	if m.slashSuggestionsHidden {
 		return nil
 	}
-	var matches []slashCommand
-	for _, command := range slashCommands {
-		if strings.HasPrefix(command.Name, input) {
-			matches = append(matches, command)
+	return m.rawMatchingSlashSuggestions(input)
+}
+
+func (m Model) rawMatchingSlashSuggestions(input string) []slashSuggestion {
+	prefix, ok := leadingSlashPrefix(input)
+	if !ok {
+		return nil
+	}
+
+	matches := make([]slashSuggestion, 0, len(builtInSlashSuggestions)+len(m.skillSuggestions))
+	for _, suggestion := range builtInSlashSuggestions {
+		if prefix == "" || strings.HasPrefix(strings.TrimPrefix(suggestion.Command, "/"), prefix) {
+			matches = append(matches, suggestion)
 		}
+	}
+	for _, skillSuggestion := range skills.FilterSkillSuggestions(m.skillSuggestions, input) {
+		matches = append(matches, slashSuggestion{
+			Command:     skillSuggestion.Command,
+			Description: skillSuggestion.Description,
+			Skill:       true,
+		})
+	}
+	if len(matches) > maxVisibleSlashSuggestions {
+		return matches[:maxVisibleSlashSuggestions]
 	}
 	return matches
 }
 
-func clampSlashSuggestionIndex(input string, index int) int {
-	matches := matchingSlashCommands(input)
+func leadingSlashPrefix(input string) (string, bool) {
+	if !strings.HasPrefix(input, "/") {
+		return "", false
+	}
+	if strings.ContainsAny(input, " \t\r\n") {
+		return "", false
+	}
+	return strings.TrimPrefix(input, "/"), true
+}
+
+func (m Model) clampSlashSuggestionIndex(input string, index int) int {
+	matches := m.matchingSlashSuggestions(input)
 	if len(matches) == 0 {
 		return 0
 	}
@@ -96,12 +132,101 @@ func clampSlashSuggestionIndex(input string, index int) int {
 	return index
 }
 
-func completeSlashCommand(input string, index int) string {
-	matches := matchingSlashCommands(input)
+func (m Model) completeSlashSuggestion(input string, index int) string {
+	matches := m.matchingSlashSuggestions(input)
 	if len(matches) == 0 {
 		return input
 	}
-	return matches[clampSlashSuggestionIndex(input, index)].Name
+	command := matches[m.clampSlashSuggestionIndex(input, index)].Command
+	if strings.HasPrefix(input, command+" ") {
+		return input
+	}
+	return command + " "
+}
+
+func (m Model) inputRunes() []rune {
+	return []rune(m.input)
+}
+
+func (m Model) clampCursor() Model {
+	length := len(m.inputRunes())
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor > length {
+		m.cursor = length
+	}
+	return m
+}
+
+func (m Model) insertInputText(text string) Model {
+	m = m.clampCursor()
+	runes := m.inputRunes()
+	insert := []rune(text)
+	next := make([]rune, 0, len(runes)+len(insert))
+	next = append(next, runes[:m.cursor]...)
+	next = append(next, insert...)
+	next = append(next, runes[m.cursor:]...)
+	m.input = string(next)
+	m.cursor += len(insert)
+	m.slashSuggestionsHidden = false
+	m.slashSuggestionIndex = m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+	return m
+}
+
+func (m Model) deleteInputBeforeCursor() Model {
+	m = m.clampCursor()
+	if m.cursor == 0 {
+		return m
+	}
+	runes := m.inputRunes()
+	next := make([]rune, 0, len(runes)-1)
+	next = append(next, runes[:m.cursor-1]...)
+	next = append(next, runes[m.cursor:]...)
+	m.input = string(next)
+	m.cursor--
+	m.slashSuggestionsHidden = false
+	m.slashSuggestionIndex = m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+	return m
+}
+
+func (m Model) moveInputCursor(delta int) Model {
+	m.cursor += delta
+	return m.clampCursor()
+}
+
+func (m Model) setInputText(input string) Model {
+	m.input = input
+	m.cursor = len([]rune(input))
+	m.slashSuggestionsHidden = false
+	m.slashSuggestionIndex = m.clampSlashSuggestionIndex(m.input, 0)
+	return m
+}
+
+func toolDisplayName(toolName, skillName string) string {
+	if skillName != "" {
+		return "skill: " + skillName
+	}
+	return toolName
+}
+
+func (m Model) renderedInputLine() string {
+	if m.isLoading {
+		return "> " + m.input
+	}
+	m = m.clampCursor()
+	runes := m.inputRunes()
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+	if len(runes) == 0 {
+		return "> " + cursorStyle.Render(" ")
+	}
+	if m.cursor >= len(runes) {
+		return "> " + string(runes) + cursorStyle.Render(" ")
+	}
+	before := string(runes[:m.cursor])
+	cursor := cursorStyle.Render(string(runes[m.cursor]))
+	after := string(runes[m.cursor+1:])
+	return "> " + before + cursor + after
 }
 
 func formatTokenStatus(promptTokens, completionTokens, windowTokens int64, warning bool) string {
@@ -130,18 +255,22 @@ func New(a *app.App) Model {
 		}
 	}
 
+	skillSuggestions := append([]skills.SkillSuggestion(nil), a.SkillSuggestions...)
+
 	return Model{
-		app:          a,
-		pub:          a.Broker,
-		sub:          a.Broker,
-		sessionID:    "default",
-		messageItems: []MessageItem{},
-		input:        "",
-		ready:        false,
-		isLoading:    false,
-		statusMsg:    "",
-		styles:       s,
-		theme:        theme,
+		app:               a,
+		pub:               a.Broker,
+		sub:               a.Broker,
+		sessionID:         "default",
+		skillSuggestions:  skillSuggestions,
+		messageItems:      []MessageItem{},
+		selectedToolIndex: -1,
+		input:             "",
+		ready:             false,
+		isLoading:         false,
+		statusMsg:         "",
+		styles:            s,
+		theme:             theme,
 	}
 }
 
@@ -202,7 +331,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 		case tea.KeyEsc:
+			if len(m.rawMatchingSlashSuggestions(m.input)) > 0 {
+				m.slashSuggestionsHidden = true
+				return m, nil
+			}
 			return m, tea.Quit
+		}
+		if msg.String() == "ctrl+e" {
+			if next, ok := m.toggleSelectedToolDetails(); ok {
+				return next, nil
+			}
+			return m, nil
 		}
 
 		if m.isLoading {
@@ -211,18 +350,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.Type {
 		case tea.KeyTab:
-			m.input = completeSlashCommand(m.input, m.slashSuggestionIndex)
+			m.input = m.completeSlashSuggestion(m.input, m.slashSuggestionIndex)
+			m.cursor = len([]rune(m.input))
 			m.slashSuggestionIndex = 0
+			m.slashSuggestionsHidden = true
 			return m, nil
 
 		case tea.KeyEnter:
 			if strings.TrimSpace(m.input) == "" {
+				if next, ok := m.toggleSelectedToolDetails(); ok {
+					return next, nil
+				}
 				return m, nil
 			}
-			if matches := matchingSlashCommands(m.input); len(matches) > 0 && m.input != matches[clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)].Name {
-				m.input = completeSlashCommand(m.input, m.slashSuggestionIndex)
-				m.slashSuggestionIndex = 0
-				return m, nil
+			if matches := m.matchingSlashSuggestions(m.input); len(matches) > 0 {
+				selected := matches[m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)]
+				if m.input != selected.Command {
+					m.input = m.completeSlashSuggestion(m.input, m.slashSuggestionIndex)
+					m.cursor = len([]rune(m.input))
+					m.slashSuggestionIndex = 0
+					m.slashSuggestionsHidden = true
+					return m, nil
+				}
 			}
 			content := m.input
 			msgID := fmt.Sprintf("msg-%d", m.msgIDSeq)
@@ -243,42 +392,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Content:   content,
 			})
 			m.input = ""
+			m.cursor = 0
 			return m, spinnerTick()
 
 		case tea.KeyBackspace, tea.KeyDelete:
-			runes := []rune(m.input)
-			if len(runes) > 0 {
-				m.input = string(runes[:len(runes)-1])
-			}
-			m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+			m = m.deleteInputBeforeCursor()
 			return m, nil
 
 		case tea.KeyUp:
-			if len(matchingSlashCommands(m.input)) > 0 {
-				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex-1)
+			if len(m.matchingSlashSuggestions(m.input)) > 0 {
+				m.slashSuggestionIndex = m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex-1)
 				return m, nil
 			}
 			if len(m.history) > 0 && m.historyIdx > 0 {
 				m.historyIdx--
-				m.input = m.history[m.historyIdx]
-				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, 0)
+				m = m.setInputText(m.history[m.historyIdx])
 			}
 			return m, nil
 
 		case tea.KeyDown:
-			if len(matchingSlashCommands(m.input)) > 0 {
-				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex+1)
+			if len(m.matchingSlashSuggestions(m.input)) > 0 {
+				m.slashSuggestionIndex = m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex+1)
 				return m, nil
 			}
 			if m.historyIdx < len(m.history)-1 {
 				m.historyIdx++
-				m.input = m.history[m.historyIdx]
-				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, 0)
+				m = m.setInputText(m.history[m.historyIdx])
 			} else {
 				m.historyIdx = len(m.history)
-				m.input = ""
-				m.slashSuggestionIndex = 0
+				m = m.setInputText("")
 			}
+			return m, nil
+
+		case tea.KeyLeft:
+			m = m.moveInputCursor(-1)
+			return m, nil
+
+		case tea.KeyRight:
+			m = m.moveInputCursor(1)
+			return m, nil
+
+		case tea.KeySpace:
+			if m.input == "" {
+				if next, ok := m.toggleSelectedToolDetails(); ok {
+					return next, nil
+				}
+			}
+			m = m.insertInputText(" ")
 			return m, nil
 
 		case tea.KeyRunes:
@@ -286,19 +446,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if r == utf8.RuneError || (unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t') {
 					continue
 				}
-				m.input += string(r)
+				m = m.insertInputText(string(r))
 			}
-			m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
 			return m, nil
 
 		default:
 			switch msg.String() {
 			case "backspace", "ctrl+h", "delete":
-				runes := []rune(m.input)
-				if len(runes) > 0 {
-					m.input = string(runes[:len(runes)-1])
-				}
-				m.slashSuggestionIndex = clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+				m = m.deleteInputBeforeCursor()
 			}
 			return m, nil
 		}
@@ -359,14 +514,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		msgID := fmt.Sprintf("msg-%d", m.msgIDSeq)
 		m.msgIDSeq++
 		paramStr := string(msg.Params)
+		displayName := toolDisplayName(msg.ToolName, msg.SkillName)
 		item := NewToolMessageItem(&Message{
 			ID:      msgID,
 			Role:    "tool",
-			Content: msg.ToolName + " " + paramStr,
-		}, msg.ToolName, m.styles)
+			Content: displayName + " " + paramStr,
+		}, displayName, m.styles)
 		item.SetStatus(ToolStatusRunning)
 		m.messageItems = append(m.messageItems, item)
-		m.statusMsg = "Running: " + msg.ToolName
+		m.statusMsg = "Running: " + displayName
 		return m, spinnerTick()
 
 	case events.SessionUpdate:
@@ -378,19 +534,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cancelledCurrentTask {
 			return m, nil
 		}
-		item := m.findPendingToolItem(msg.ToolName)
+		displayName := toolDisplayName(msg.ToolName, msg.SkillName)
+		item := m.findPendingToolItem(displayName)
 		if item != nil {
 			if msg.Error != "" {
 				item.SetStatus(ToolStatusError)
 				item.SetResult(msg.Error)
-				m.statusMsg = "Tool error: " + msg.ToolName
+				m.statusMsg = "Tool error: " + displayName
 			} else {
 				item.SetStatus(ToolStatusSuccess)
 				if msg.Result != "" {
 					item.SetResult(msg.Result)
 				}
-				m.statusMsg = "Tool done: " + msg.ToolName
+				m.statusMsg = "Tool done: " + displayName
 			}
+			m.selectedToolIndex = m.latestExpandableToolIndex()
 		}
 		return m, nil
 
@@ -425,6 +583,49 @@ func (m *Model) findPendingToolItem(toolName string) *ToolMessageItem {
 		}
 	}
 	return nil
+}
+
+func (m Model) latestExpandableToolIndex() int {
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		if item, ok := m.messageItems[i].(*ToolMessageItem); ok && item.resultContent != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m Model) expandedToolIndex() int {
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		if item, ok := m.messageItems[i].(*ToolMessageItem); ok && item.expandedContent {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m Model) toggleSelectedToolDetails() (Model, bool) {
+	index := m.expandedToolIndex()
+	if index < 0 {
+		index = m.selectedToolIndex
+	}
+	if index < 0 || index >= len(m.messageItems) {
+		index = m.latestExpandableToolIndex()
+	}
+	if index < 0 {
+		return m, false
+	}
+	item, ok := m.messageItems[index].(*ToolMessageItem)
+	if !ok || item.resultContent == "" {
+		return m, false
+	}
+	item.ToggleContent()
+	m.selectedToolIndex = index
+	if item.expandedContent {
+		m.statusMsg = "已展开工具详情: " + item.toolName
+	} else {
+		m.statusMsg = "已收起工具详情: " + item.toolName
+	}
+	return m, true
 }
 
 // View 渲染界面 — 使用 MessageItem 接口委托渲染
@@ -509,7 +710,7 @@ func (m Model) View() string {
 
 	// 命令提示区
 	if !m.isLoading {
-		matches := matchingSlashCommands(m.input)
+		matches := m.matchingSlashSuggestions(m.input)
 		if len(matches) > 0 {
 			hintStyle := lipgloss.NewStyle().
 				Foreground(s.FgMuted).
@@ -519,11 +720,11 @@ func (m Model) View() string {
 				Bold(true)
 
 			b.WriteString("\n")
-			b.WriteString(hintStyle.Render("Slash commands:"))
+			b.WriteString(hintStyle.Render("Slash suggestions:"))
 			b.WriteString("\n")
-			selected := clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
+			selected := m.clampSlashSuggestionIndex(m.input, m.slashSuggestionIndex)
 			for i, command := range matches {
-				line := fmt.Sprintf("  %s  %s", command.Name, command.Description)
+				line := fmt.Sprintf("  %s  %s", command.Command, command.Description)
 				if i == selected {
 					line += "  (Tab/Enter)"
 					b.WriteString(selectedStyle.Render(line))
@@ -542,11 +743,7 @@ func (m Model) View() string {
 		Padding(0, 1).
 		Width(contentWidth)
 
-	inputLine := "> " + m.input
-	if !m.isLoading {
-		inputLine += "_"
-	}
-	b.WriteString(inputStyle.Render(inputLine))
+	b.WriteString(inputStyle.Render(m.renderedInputLine()))
 
 	return b.String()
 }

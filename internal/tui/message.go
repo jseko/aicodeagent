@@ -80,8 +80,8 @@ type Message struct {
 // UserMessageItem 用户消息渲染（主色调圆角边框 + Markdown）
 type UserMessageItem struct {
 	*cachedMessageItem
-	message *Message
-	styles  *Styles
+	message    *Message
+	styles     *Styles
 	mdRenderer *MarkdownRenderer
 }
 
@@ -300,7 +300,7 @@ func (t *ToolMessageItem) Render(width int) string {
 		sections = append(sections, lipgloss.NewStyle().
 			Foreground(t.styles.FgSubtle).
 			PaddingLeft(2).
-			Render("(展开查看详情)"))
+			Render("(按 Ctrl+E 展开详情；空闲时 Enter/Space 也可展开)"))
 	}
 
 	result := t.styles.Chat.ToolMsg.Width(width).Render(strings.Join(sections, "\n"))

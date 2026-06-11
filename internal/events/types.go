@@ -52,6 +52,7 @@ type ToolCall struct {
 	SessionID string          `json:"session_id"`
 	ToolName  string          `json:"tool_name"`
 	Params    json.RawMessage `json:"params"`
+	SkillName string          `json:"skill_name,omitempty"`
 	Time      time.Time       `json:"time"`
 }
 
@@ -62,6 +63,7 @@ func (e ToolCall) Timestamp() time.Time { return e.Time }
 type ToolResult struct {
 	SessionID string    `json:"session_id"`
 	ToolName  string    `json:"tool_name"`
+	SkillName string    `json:"skill_name,omitempty"`
 	Result    string    `json:"result"`
 	Error     string    `json:"error"`
 	Time      time.Time `json:"time"`

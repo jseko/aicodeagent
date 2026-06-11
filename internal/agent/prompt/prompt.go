@@ -39,11 +39,12 @@ type ContextFile struct {
 
 // PromptData 五层提示词数据
 type PromptData struct {
-	System      string        // 第1层：系统身份与核心规则
-	Environment string        // 第2层：运行时环境信息
-	Tools       string        // 第3层：可用工具描述
-	Project     string        // 第4层：项目上下文
-	Task        string        // 第5层：当前任务
+	System      string // 第1层：系统身份与核心规则
+	Environment string // 第2层：运行时环境信息
+	Tools       string // 第3层：可用工具描述
+	Skills      string // 第4层：可用技能元数据
+	Project     string // 第5层：项目上下文
+	Task        string // 第6层：当前任务
 }
 
 func (p *PromptData) String() string {
@@ -55,6 +56,7 @@ func (p *PromptData) String() string {
 		{"system", p.System},
 		{"environment", p.Environment},
 		{"tools", p.Tools},
+		{"skills", p.Skills},
 		{"project", p.Project},
 		{"task", p.Task},
 	}
@@ -176,6 +178,25 @@ func (b *PromptBuilder) WithProjectContext(content string) *PromptBuilder {
 	}
 	b.data.Project = content
 	return b
+}
+
+func (b *PromptBuilder) WithSkills(availableSkillsXML string) *PromptBuilder {
+	if b.err != nil {
+		return b
+	}
+	availableSkillsXML = strings.TrimSpace(availableSkillsXML)
+	if availableSkillsXML == "" {
+		return b
+	}
+	b.data.Skills = availableSkillsXML + "\n\n" + skillsUsageGuidance()
+	return b
+}
+
+func skillsUsageGuidance() string {
+	return `<skills_usage>
+When a user task matches a skill's description, read the skill's SKILL.md file to get full instructions.
+Skill instructions guide workflow execution, but they do not override system safety rules, user instructions, project constraints, or tool permission checks.
+</skills_usage>`
 }
 
 // WithTask 设置任务层

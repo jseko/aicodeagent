@@ -219,3 +219,161 @@ func TestViewExecuteUnicodePath(t *testing.T) {
 		t.Fatalf("expected '%s', got '%s'", content, result.Output)
 	}
 }
+
+func TestViewExecuteSkillRootReadOutsideWorkdir(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	content := "# Skill instructions"
+	path := filepath.Join(skillRoot, "code-review", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	params, _ := json.Marshal(ViewParams{FilePath: path})
+
+	result, err := v.Execute(context.Background(), params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("skill file should be readable, got: %s", result.Error)
+	}
+	if result.Output != content {
+		t.Fatalf("expected %q, got %q", content, result.Output)
+	}
+}
+
+func TestViewExecuteSkillAssetReadOutsideWorkdir(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	content := "asset content"
+	path := filepath.Join(skillRoot, "code-review", "assets", "guide.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	params, _ := json.Marshal(ViewParams{FilePath: path})
+
+	result, err := v.Execute(context.Background(), params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("skill asset should be readable, got: %s", result.Error)
+	}
+	if result.Output != content {
+		t.Fatalf("expected %q, got %q", content, result.Output)
+	}
+}
+
+func TestViewExecuteRejectsOutsideSkillRoot(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	outside := t.TempDir()
+	path := filepath.Join(outside, "secret.md")
+	if err := os.WriteFile(path, []byte("secret"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	params, _ := json.Marshal(ViewParams{FilePath: path})
+
+	result, err := v.Execute(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatal("outside skill root should be rejected")
+	}
+}
+
+func TestViewExecuteRejectsSkillSymlinkEscape(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.md")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(skillRoot, "code-review", "secret.md")
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, linkPath); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	params, _ := json.Marshal(ViewParams{FilePath: linkPath})
+
+	result, err := v.Execute(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatal("skill symlink escaping root should be rejected")
+	}
+}
+
+func TestViewExecuteRejectsOversizedSkillFile(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	path := filepath.Join(skillRoot, "code-review", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxSkillFileSize + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	params, _ := json.Marshal(ViewParams{FilePath: path})
+	result, err := v.Execute(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Fatal("oversized skill file should be rejected")
+	}
+	if result.Error != "技能文件过大（>1MB）" {
+		t.Fatalf("expected skill size error, got %q", result.Error)
+	}
+}
+
+func TestViewAllowsSkillRead(t *testing.T) {
+	workDir := t.TempDir()
+	skillRoot := t.TempDir()
+	inside := filepath.Join(skillRoot, "code-review", "SKILL.md")
+	outside := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(inside), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inside, []byte("# Instructions"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("# Outside"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewView(workDir).WithSkillRoots([]string{skillRoot})
+	if !v.AllowsSkillRead(inside) {
+		t.Fatal("skill path should be allowed")
+	}
+	if v.AllowsSkillRead(outside) {
+		t.Fatal("outside path should not be allowed")
+	}
+}

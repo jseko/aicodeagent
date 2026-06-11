@@ -70,6 +70,21 @@ func TestMultiLineEditor_InsertText(t *testing.T) {
 	}
 }
 
+func TestMultiLineEditor_InsertSpace(t *testing.T) {
+	editor := NewMultiLineEditor(DefaultDarkStyles())
+
+	updated, _ := editor.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h', 'i'}})
+	editor = updated.(*MultiLineEditor)
+	updated, _ = editor.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	editor = updated.(*MultiLineEditor)
+	updated, _ = editor.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t', 'h', 'e', 'r', 'e'}})
+	editor = updated.(*MultiLineEditor)
+
+	if got := editor.Value(); got != "hi there" {
+		t.Fatalf("expected space in editor value, got %q", got)
+	}
+}
+
 func TestMultiLineEditor_InsertNewLine(t *testing.T) {
 	styles := DefaultDarkStyles()
 	e := NewMultiLineEditor(styles)

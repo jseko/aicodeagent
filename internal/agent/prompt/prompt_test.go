@@ -170,6 +170,64 @@ func TestPromptBuilderWithTask(t *testing.T) {
 	}
 }
 
+func TestPromptBuilderWithSkills(t *testing.T) {
+	b := NewPromptBuilder().
+		WithSystem("Agent", "helper", nil).
+		WithSkills("<available_skills>\n  <skill><name>code-review</name></skill>\n</available_skills>")
+
+	result, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, want := range []string{
+		"<skills>",
+		"<available_skills>",
+		"<skills_usage>",
+		"read the skill's SKILL.md file",
+		"do not override system safety rules",
+		"tool permission checks",
+	} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("result missing %q:\n%s", want, result)
+		}
+	}
+}
+
+func TestPromptBuilderWithEmptySkills(t *testing.T) {
+	b := NewPromptBuilder().
+		WithSystem("Agent", "helper", nil).
+		WithSkills("   ")
+
+	result, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(result, "<skills>") {
+		t.Fatalf("result should omit empty skills layer:\n%s", result)
+	}
+}
+
+func TestPromptBuilderSkillsAffectCacheIdentity(t *testing.T) {
+	base := NewPromptBuilder().WithSystem("Agent", "helper", nil)
+	withoutSkills, err := base.Build()
+	if err != nil {
+		t.Fatalf("Build without skills: %v", err)
+	}
+
+	withSkills, err := NewPromptBuilder().
+		WithSystem("Agent", "helper", nil).
+		WithSkills("<available_skills><skill><name>a</name></skill></available_skills>").
+		Build()
+	if err != nil {
+		t.Fatalf("Build with skills: %v", err)
+	}
+
+	if withoutSkills == withSkills {
+		t.Fatal("skills layer should change built prompt cache identity input")
+	}
+}
+
 func TestPromptBuilderFullFiveLayers(t *testing.T) {
 	b := NewPromptBuilder().
 		WithSystem("AI Agent", "智能编程助手", []string{"规则A", "规则B"}).
@@ -180,6 +238,7 @@ func TestPromptBuilderFullFiveLayers(t *testing.T) {
 			Date:       "2025-01-15",
 		}).
 		WithTools([]ToolInfo{{Name: "tool1", Description: "工具1"}}).
+		WithSkills("<available_skills><skill><name>skill1</name></skill></available_skills>").
 		WithProject([]ContextFile{{Path: "README.md", Content: "# Test"}}).
 		WithTask("编写单元测试")
 
@@ -188,8 +247,8 @@ func TestPromptBuilderFullFiveLayers(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	// 五层都应存在
-	for _, layer := range []string{"<system>", "<environment>", "<tools>", "<project>", "<task>"} {
+	// 六层都应存在
+	for _, layer := range []string{"<system>", "<environment>", "<tools>", "<skills>", "<project>", "<task>"} {
 		if !strings.Contains(result, layer) {
 			t.Errorf("result missing layer tag %q:\n%s", layer, result)
 		}
@@ -201,6 +260,7 @@ func TestPromptBuilderLayerOrdering(t *testing.T) {
 		WithSystem("Agent", "helper", nil).
 		WithEnvironmentInfo(EnvironmentInfo{OS: "linux", Shell: "/bin/sh", WorkingDir: "/tmp", Date: "2025-01-01"}).
 		WithTools([]ToolInfo{{Name: "tool", Description: "desc"}}).
+		WithSkills("<available_skills><skill><name>skill</name></skill></available_skills>").
 		WithTask("task")
 
 	result, err := b.Build()
@@ -211,15 +271,16 @@ func TestPromptBuilderLayerOrdering(t *testing.T) {
 	systemIdx := strings.Index(result, "<system>")
 	envIdx := strings.Index(result, "<environment>")
 	toolsIdx := strings.Index(result, "<tools>")
+	skillsIdx := strings.Index(result, "<skills>")
 	taskIdx := strings.Index(result, "<task>")
 
-	if systemIdx < 0 || envIdx < 0 || toolsIdx < 0 || taskIdx < 0 {
+	if systemIdx < 0 || envIdx < 0 || toolsIdx < 0 || skillsIdx < 0 || taskIdx < 0 {
 		t.Fatal("all layers should be present")
 	}
 
-	if !(systemIdx < envIdx && envIdx < toolsIdx && toolsIdx < taskIdx) {
-		t.Errorf("layers out of order: system=%d env=%d tools=%d task=%d\n%s",
-			systemIdx, envIdx, toolsIdx, taskIdx, result)
+	if !(systemIdx < envIdx && envIdx < toolsIdx && toolsIdx < skillsIdx && skillsIdx < taskIdx) {
+		t.Errorf("layers out of order: system=%d env=%d tools=%d skills=%d task=%d\n%s",
+			systemIdx, envIdx, toolsIdx, skillsIdx, taskIdx, result)
 	}
 }
 
