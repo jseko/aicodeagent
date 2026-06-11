@@ -65,6 +65,9 @@ type coordinator struct {
 	matcher      *SkillMatcher
 	confirmFn    func(toolName, arguments string) bool // 可注入的确认回调，测试用
 	pendingInit  *initializeResult                     // 待确认的 /initialize 结果
+	sub          pubsub.Subscriber[events.Event]
+	pendingConfs map[string]chan bool
+	confirmMu    sync.Mutex
 }
 
 // MessageService 消息持久化服务接口
@@ -139,6 +142,11 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 	}
 	c.toolCaller = tools.NewToolCaller(toolRegistry, permService)
 	c.confirmFn = c.requestUserConfirmation
+	c.pendingConfs = make(map[string]chan bool)
+	if sub, ok := broker.(pubsub.Subscriber[events.Event]); ok {
+		c.sub = sub
+		go c.listenConfirmations()
+	}
 
 	// 异步初始化Agent（带超时控制）
 	go func() {
@@ -839,19 +847,65 @@ func (c *coordinator) handleToolCallsForSession(ctx context.Context, sessionID s
 	return results, nil
 }
 
-// requestUserConfirmation 请求用户确认危险操作
+// requestUserConfirmation 请求用户确认危险操作（通过 Broker 事件往返）
 func (c *coordinator) requestUserConfirmation(toolName, arguments string) bool {
+	if c.sub == nil {
+		return false
+	}
+
+	requestID := fmt.Sprintf("perm-%d", time.Now().UnixNano())
+	respCh := make(chan bool, 1)
+
+	c.confirmMu.Lock()
+	c.pendingConfs[requestID] = respCh
+	c.confirmMu.Unlock()
+
+	defer func() {
+		c.confirmMu.Lock()
+		delete(c.pendingConfs, requestID)
+		c.confirmMu.Unlock()
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	c.broker.PublishMustDeliver(ctx, events.ToolCall{
-		SessionID: "",
+	c.broker.PublishMustDeliver(ctx, events.PermissionRequest{
+		RequestID: requestID,
 		ToolName:  toolName,
-		Params:    json.RawMessage(arguments),
+		Command:   arguments,
 		Time:      time.Now(),
 	})
 
-	return false
+	select {
+	case allowed := <-respCh:
+		return allowed
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// listenConfirmations 订阅 PermissionResponse 事件，路由到等待的确认通道
+func (c *coordinator) listenConfirmations() {
+	ch := c.sub.Subscribe(context.Background())
+	for {
+		event, ok := <-ch
+		if !ok {
+			return
+		}
+		resp, ok := event.(events.PermissionResponse)
+		if !ok {
+			continue
+		}
+		c.confirmMu.Lock()
+		respCh, ok := c.pendingConfs[resp.RequestID]
+		c.confirmMu.Unlock()
+		if ok {
+			select {
+			case respCh <- resp.Allowed:
+			default:
+			}
+		}
+	}
 }
 
 // Cancel 取消指定会话

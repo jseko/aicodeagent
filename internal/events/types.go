@@ -10,13 +10,15 @@ import (
 type EventType string
 
 const (
-	TypeUserMessage   EventType = "user.message"
-	TypeAgentThink    EventType = "agent.think"
-	TypeToolCall      EventType = "tool.call"
-	TypeToolResult    EventType = "tool.result"
-	TypeSessionUpdate EventType = "session.update"
-	TypeCancelTask    EventType = "task.cancel"
-	TypeError         EventType = "error"
+	TypeUserMessage        EventType = "user.message"
+	TypeAgentThink         EventType = "agent.think"
+	TypeToolCall           EventType = "tool.call"
+	TypeToolResult         EventType = "tool.result"
+	TypeSessionUpdate      EventType = "session.update"
+	TypeCancelTask         EventType = "task.cancel"
+	TypeError              EventType = "error"
+	TypePermissionRequest  EventType = "permission.request"
+	TypePermissionResponse EventType = "permission.response"
 )
 
 // Event 基础事件接口
@@ -104,3 +106,27 @@ type ErrorEvent struct {
 
 func (e ErrorEvent) Type() EventType      { return TypeError }
 func (e ErrorEvent) Timestamp() time.Time { return e.Time }
+
+// PermissionRequest 权限确认请求（Coordinator → TUI）
+type PermissionRequest struct {
+	RequestID string    `json:"request_id"`
+	SessionID string    `json:"session_id"`
+	ToolName  string    `json:"tool_name"`
+	Command   string    `json:"command"`
+	Time      time.Time `json:"time"`
+}
+
+func (e PermissionRequest) Type() EventType      { return TypePermissionRequest }
+func (e PermissionRequest) Timestamp() time.Time { return e.Time }
+
+// PermissionResponse 权限确认响应（TUI → Coordinator）
+type PermissionResponse struct {
+	RequestID string    `json:"request_id"`
+	SessionID string    `json:"session_id"`
+	Allowed   bool      `json:"allowed"`
+	Action    string    `json:"action"` // "allow", "allow_session", "deny"
+	Time      time.Time `json:"time"`
+}
+
+func (e PermissionResponse) Type() EventType      { return TypePermissionResponse }
+func (e PermissionResponse) Timestamp() time.Time { return e.Time }

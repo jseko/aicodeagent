@@ -55,6 +55,16 @@ type Model struct {
 	// 滚动状态（智能滚动，例9-5）
 	scrollPos   int // 0=底部，正数=向上滚动行数
 	wasAtBottom bool
+
+	// 权限确认状态
+	pendingConfirm *ConfirmationState
+}
+
+// ConfirmationState 权限确认请求的 TUI 状态
+type ConfirmationState struct {
+	RequestID string
+	ToolName  string
+	Command   string
 }
 
 // SpinnerTickMsg 旋转动画定时消息
@@ -344,6 +354,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if m.pendingConfirm != nil {
+			return m.handlePermissionKey(msg)
+		}
+
 		if m.isLoading {
 			return m, nil
 		}
@@ -381,6 +395,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Role:    "user",
 				Content: content,
 			}, m.styles)
+
 			m.messageItems = append(m.messageItems, userItem)
 			m.history = append(m.history, content)
 			m.historyIdx = len(m.history)
@@ -568,9 +583,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}, m.styles)
 		m.messageItems = append(m.messageItems, errItem)
 		return m, nil
+
+	case events.PermissionRequest:
+		m.pendingConfirm = &ConfirmationState{
+			RequestID: msg.RequestID,
+			ToolName:  msg.ToolName,
+			Command:   msg.Command,
+		}
+		m.statusMsg = fmt.Sprintf("确认执行 %s? [y]允许一次 [a]会话允许 [n]拒绝", msg.ToolName)
+		return m, nil
 	}
 
 	return m, nil
+}
+
+func (m Model) handlePermissionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	action, allowed, ok := permissionKeyAction(msg.String())
+	if !ok {
+		return m, nil
+	}
+	pending := m.pendingConfirm
+	m.pendingConfirm = nil
+	m.statusMsg = "已处理权限请求: " + action
+	m.pub.Publish(events.PermissionResponse{
+		RequestID: pending.RequestID,
+		SessionID: m.sessionID,
+		Allowed:   allowed,
+		Action:    action,
+		Time:      time.Now(),
+	})
+	return m, nil
+}
+
+func permissionKeyAction(key string) (string, bool, bool) {
+	switch key {
+	case "y", "Y":
+		return "allow", true, true
+	case "a", "A":
+		return "allow_session", true, true
+	case "n", "N", "esc":
+		return "deny", false, true
+	default:
+		return "", false, false
+	}
 }
 
 // findPendingToolItem 从末尾查找匹配的待处理工具项
@@ -676,6 +731,22 @@ func (m Model) View() string {
 
 	for _, item := range m.messageItems[visibleStart:visibleEnd] {
 		b.WriteString(item.Render(contentWidth))
+		b.WriteString("\n")
+	}
+
+	if m.pendingConfirm != nil {
+		confirmStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(s.Warning).
+			Foreground(s.Warning).
+			Padding(0, 1).
+			Width(contentWidth)
+		b.WriteString("\n")
+		b.WriteString(confirmStyle.Render(fmt.Sprintf(
+			"权限确认: %s\n参数: %s\n[y] 允许一次   [a] 本会话允许   [n] 拒绝",
+			m.pendingConfirm.ToolName,
+			m.pendingConfirm.Command,
+		)))
 		b.WriteString("\n")
 	}
 
