@@ -63,6 +63,43 @@ func TestBuildSystemPromptMergesBaseProjectContextAndMCPInstructions(t *testing.
 	}
 }
 
+func TestProcessUserContextPathLoadsUserAgents(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeProjectMemoryFile(t, home, ".aicode/AGENTS.md", "user agent rules")
+	writeProjectMemoryFile(t, home, ".aicode/AGENTS.cn.md", "用户规则")
+
+	files := processUserContextPath(defaultMemoryMaxBytes)
+
+	if len(files) != 2 {
+		t.Fatalf("len(files) = %d, want 2", len(files))
+	}
+	wantSuffixes := []string{".aicode/AGENTS.md", ".aicode/AGENTS.cn.md"}
+	wantContents := []string{"user agent rules", "用户规则"}
+	for i := range files {
+		if !strings.HasSuffix(files[i].Path, wantSuffixes[i]) {
+			t.Fatalf("files[%d].Path = %q, want suffix %q", i, files[i].Path, wantSuffixes[i])
+		}
+		if files[i].Content != wantContents[i] {
+			t.Fatalf("files[%d].Content = %q, want %q", i, files[i].Content, wantContents[i])
+		}
+	}
+}
+
+func TestFormatContextFilesKeepsUserBeforeProjectOrder(t *testing.T) {
+	files := append(
+		[]ContextFile{{Path: "/home/user/.aicode/AGENTS.md", Content: "user rules"}},
+		[]ContextFile{{Path: "/repo/AGENTS.md", Content: "project rules"}}...,
+	)
+	formatted := formatContextFiles(files)
+
+	userIndex := strings.Index(formatted, "user rules")
+	projectIndex := strings.Index(formatted, "project rules")
+	if userIndex < 0 || projectIndex < 0 || userIndex > projectIndex {
+		t.Fatalf("expected user context before project context:\n%s", formatted)
+	}
+}
+
 func writeProjectMemoryFile(t *testing.T, root, name, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)

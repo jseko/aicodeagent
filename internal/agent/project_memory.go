@@ -22,6 +22,11 @@ var projectMemoryFiles = []string{
 	".github/copilot-instructions.md",
 }
 
+var userMemoryFiles = []string{
+	"~/.aicode/AGENTS.md",
+	"~/.aicode/AGENTS.cn.md",
+}
+
 type ContextFile struct {
 	Path    string
 	Content string
@@ -41,6 +46,36 @@ func processContextPath(root string, maxBytes int64) []ContextFile {
 		files = append(files, ContextFile{Path: path, Content: content})
 	}
 	return files
+}
+
+func processUserContextPath(maxBytes int64) []ContextFile {
+	if maxBytes <= 0 {
+		maxBytes = defaultMemoryMaxBytes
+	}
+	var files []ContextFile
+	for _, name := range userMemoryFiles {
+		path := expandHome(name)
+		content, ok := readContextFile(path, maxBytes)
+		if !ok {
+			continue
+		}
+		files = append(files, ContextFile{Path: path, Content: content})
+	}
+	return files
+}
+
+func expandHome(path string) string {
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	}
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
 }
 
 func readContextFile(path string, maxBytes int64) (string, bool) {

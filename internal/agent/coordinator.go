@@ -20,6 +20,7 @@ import (
 	"AICodeAgent/internal/llm"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
+	"AICodeAgent/internal/rules"
 	"AICodeAgent/internal/skills"
 	"golang.org/x/sync/errgroup"
 )
@@ -60,6 +61,7 @@ type coordinator struct {
 	permService  *permission.PermissionService
 	broker       pubsub.Publisher[events.Event]
 	skills       *skills.Manager
+	rulesLoader  *rules.Loader
 	matcher      *SkillMatcher
 	confirmFn    func(toolName, arguments string) bool // 可注入的确认回调，测试用
 	pendingInit  *initializeResult                     // 待确认的 /initialize 结果
@@ -131,6 +133,7 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 		permService: permService,
 		broker:      broker,
 		skills:      skills.NewManager("."),
+		rulesLoader: rules.NewLoader("."),
 		running:     make(map[string]context.CancelFunc),
 		sessionIDs:  make(map[string]string),
 	}
@@ -240,7 +243,10 @@ func (c *coordinator) buildModel(ctx context.Context, selected config.SelectedMo
 // loadSystemPrompt 加载系统提示词（使用五层 PromptBuilder）
 func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAgent) {
 	envInfo := collectEnvInfo(".")
-	contextFiles := processContextPath(envInfo.WorkingDir, c.config.Context.MemoryMaxBytes)
+	contextFiles := append(
+		processUserContextPath(c.config.Context.MemoryMaxBytes),
+		processContextPath(envInfo.WorkingDir, c.config.Context.MemoryMaxBytes)...,
+	)
 	mcpInstr := getMCPInstructions(context.Background(), 3*time.Second)
 
 	projectContent := formatContextFiles(contextFiles)
@@ -253,9 +259,10 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 	}
 
 	availableSkillsXML := c.loadAvailableSkills(envInfo.WorkingDir)
+	renderedRules := c.loadRenderedRules(envInfo.WorkingDir)
 
 	builder := prompt.NewPromptBuilder().
-		WithSystem("AICodeAgent", "一个运行在终端的AI编程助手", ruleStrings(DefaultRules())).
+		WithSystem("AICodeAgent", "一个运行在终端的AI编程助手"+renderedRules, ruleStrings(DefaultRules())).
 		WithEnvironmentInfo(prompt.EnvironmentInfo{
 			OS:         runtime.GOOS,
 			Shell:      os.Getenv("SHELL"),
@@ -284,6 +291,23 @@ func (c *coordinator) loadSystemPrompt(cfg config.AgentConfig, agent *sessionAge
 	agent.smallSystemPrompt = smallPrompt
 	agent.temperature = c.config.OpenAI.Temperature
 	log.Println("[Coordinator] 系统提示词加载完成")
+}
+
+func (c *coordinator) loadRenderedRules(projectDir string) string {
+	if c.rulesLoader == nil {
+		c.rulesLoader = rules.NewLoader(projectDir)
+	}
+	c.rulesLoader.SetWorkingDir(projectDir)
+	set, err := c.rulesLoader.LoadRules()
+	if err != nil {
+		log.Printf("[Coordinator] 规则加载失败: %v", err)
+		return ""
+	}
+	rendered := rules.RenderPrompt(set)
+	if strings.TrimSpace(rendered) == "" {
+		return ""
+	}
+	return "\n\n" + rendered
 }
 
 func (c *coordinator) loadAvailableSkills(projectDir string) string {
@@ -503,7 +527,7 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 
 			// 转换 ToolCallDelta → ToolCall 并执行
 			agentToolCalls := convertToolCallDeltas(result.ToolCalls)
-			toolResults, _ := c.handleToolCalls(runCtx, agentToolCalls)
+			toolResults, _ := c.handleToolCallsForSession(runCtx, session.ID, agentToolCalls)
 
 			// 发布工具结果事件（关联工具名）
 			for idx, tr := range toolResults {
@@ -750,13 +774,17 @@ func (c *coordinator) PublishToolResult(result events.ToolResult) {
 // handleToolCalls 工具调用完整处理流程（查找→鉴权→确认→执行→结果）
 // 对应 ch6.md 例6-5
 func (c *coordinator) handleToolCalls(ctx context.Context, toolCalls []ToolCall) ([]Message, error) {
+	return c.handleToolCallsForSession(ctx, "default", toolCalls)
+}
+
+func (c *coordinator) handleToolCallsForSession(ctx context.Context, sessionID string, toolCalls []ToolCall) ([]Message, error) {
 	var results []Message
 
 	for _, call := range toolCalls {
 		params := json.RawMessage(call.Function.Arguments)
 
-		// 1-2. 工具查找+权限检查（通过 ToolCaller 共享逻辑）
-		tool, allow, needConfirm, reason := c.toolCaller.ResolveAndCheck(call.Function.Name, params)
+		// 1. 工具查找 + 权限检查
+		tool, allow, needConfirm, reason := c.toolCaller.ResolveAndCheckForSession(sessionID, call.Function.Name, params)
 		if tool == nil {
 			results = append(results, Message{
 				Role:       RoleTool,
@@ -776,6 +804,9 @@ func (c *coordinator) handleToolCalls(ctx context.Context, toolCalls []ToolCall)
 					})
 					continue
 				}
+				if sessionID != "" && c.permService != nil {
+					c.permService.ApproveOperation(sessionID, call.Function.Name, params)
+				}
 			} else {
 				results = append(results, Message{
 					Role:       RoleTool,
@@ -786,8 +817,8 @@ func (c *coordinator) handleToolCalls(ctx context.Context, toolCalls []ToolCall)
 			}
 		}
 
-		// 3. 执行工具
-		result, err := tool.Execute(ctx, params)
+		// 2. 统一通过 ToolCaller 执行，确保审计和防护链路一致
+		result, err := c.toolCaller.CallTool(ctx, sessionID, call.Function.Name, params)
 
 		var content string
 		if err != nil {
@@ -820,7 +851,7 @@ func (c *coordinator) requestUserConfirmation(toolName, arguments string) bool {
 		Time:      time.Now(),
 	})
 
-	return true
+	return false
 }
 
 // Cancel 取消指定会话

@@ -5,3 +5,5 @@ AICodeAgent
 aicodeagent.log
 .chat/
 .serena/
+.aicode/
+AGENTS.md

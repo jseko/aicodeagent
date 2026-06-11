@@ -13,9 +13,9 @@ type PermLevel int
 
 const (
 	PermLevelGuest    PermLevel = iota // 0: 访客，仅查询
-	PermLevelNormal                     // 1: 普通，可读文件
-	PermLevelAdvanced                   // 2: 高级，可写文件
-	PermLevelAdmin                      // 3: 管理员，可执行命令
+	PermLevelNormal                    // 1: 普通，可读文件
+	PermLevelAdvanced                  // 2: 高级，可写文件
+	PermLevelAdmin                     // 3: 管理员，可执行命令
 )
 
 // AuditRecord 权限检查审计记录
@@ -27,6 +27,14 @@ type AuditRecord struct {
 	Reason    string
 }
 
+// PermissionRequest 权限请求（事件驱动确认）
+type PermissionRequest struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	ToolName  string `json:"tool_name"`
+	Action    string `json:"action"`
+}
+
 // PermissionService 权限控制服务（三层检查：黑名单→白名单→确认）
 type PermissionService struct {
 	blacklist        map[string]bool
@@ -34,6 +42,7 @@ type PermissionService struct {
 	auditLog         []AuditRecord
 	auditMu          sync.Mutex
 	sessionPermCache map[string]PermLevel
+	sessionOpsCache  map[string]map[string]bool // sessionID → cacheKey → approved
 	fileWhitelist    []string
 	cmdWhitelist     []string
 	defaultLevel     PermLevel
@@ -47,6 +56,7 @@ func NewPermissionService(defaultLevel PermLevel, fileWhitelist, cmdWhitelist []
 		whitelist:        make(map[string]bool),
 		auditLog:         make([]AuditRecord, 0),
 		sessionPermCache: make(map[string]PermLevel),
+		sessionOpsCache:  make(map[string]map[string]bool),
 		fileWhitelist:    fileWhitelist,
 		cmdWhitelist:     cmdWhitelist,
 		defaultLevel:     defaultLevel,
@@ -182,6 +192,54 @@ func (s *PermissionService) isInWhitelist(path string, whitelist []string) bool 
 }
 
 // isInCmdWhitelist 检查命令是否在白名单内（命令边界安全匹配）
+// buildOpKey 构造保守的缓存键（工具名 + 核心参数）
+func buildOpKey(toolName string, params json.RawMessage) string {
+	var sb strings.Builder
+	sb.WriteString(toolName)
+	if params != nil && len(params) > 0 {
+		var m map[string]interface{}
+		if err := json.Unmarshal(params, &m); err == nil {
+			for _, k := range []string{"file_path", "command", "path"} {
+				if v, ok := m[k].(string); ok && v != "" {
+					sb.WriteString(":")
+					sb.WriteString(v)
+					break
+				}
+			}
+		}
+	}
+	return sb.String()
+}
+
+// ApproveOperation 记录会话级操作批准
+func (s *PermissionService) ApproveOperation(sessionID string, toolName string, params json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := buildOpKey(toolName, params)
+	if s.sessionOpsCache[sessionID] == nil {
+		s.sessionOpsCache[sessionID] = make(map[string]bool)
+	}
+	s.sessionOpsCache[sessionID][key] = true
+}
+
+// IsOperationApproved 检查操作是否已被该会话批准
+func (s *PermissionService) IsOperationApproved(sessionID string, toolName string, params json.RawMessage) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := buildOpKey(toolName, params)
+	if ops, ok := s.sessionOpsCache[sessionID]; ok {
+		return ops[key]
+	}
+	return false
+}
+
+// RevokeSessionApprovals 撤销会话所有批准
+func (s *PermissionService) RevokeSessionApprovals(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessionOpsCache, sessionID)
+}
+
 func (s *PermissionService) isInCmdWhitelist(cmd string, whitelist []string) bool {
 	for _, allowed := range whitelist {
 		if strings.HasPrefix(cmd, allowed) && (len(cmd) == len(allowed) || cmd[len(allowed)] == ' ') {

@@ -10,6 +10,7 @@ import (
 
 	"AICodeAgent/internal/agent/tools"
 	"AICodeAgent/internal/config"
+	"AICodeAgent/internal/events"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/skills"
 )
@@ -38,13 +39,19 @@ func setupTestCoordinator() *coordinator {
 	ps.AddWhitelist("/workspace")
 
 	return &coordinator{
-		tools:      r,
-		toolCaller: tools.NewToolCaller(r, ps),
-		confirmFn:  func(toolName, arguments string) bool { return true },
+		tools:       r,
+		permService: ps,
+		toolCaller:  tools.NewToolCaller(r, ps),
+		confirmFn:   func(toolName, arguments string) bool { return true },
 	}
 }
 
 // testTool 实现 tools.Tool 接口的测试桩
+type testBroker struct{}
+
+func (b *testBroker) Publish(event events.Event)                                 {}
+func (b *testBroker) PublishMustDeliver(ctx context.Context, event events.Event) {}
+
 type testTool struct {
 	name        string
 	description string
@@ -130,6 +137,56 @@ func TestHandleToolCallsNormalExecution(t *testing.T) {
 	}
 	if results[0].ToolCallID != "call_1" {
 		t.Fatalf("expected ToolCallID 'call_1', got '%s'", results[0].ToolCallID)
+	}
+}
+
+func TestHandleToolCallsConfirmedGreyZoneExecutesAndCachesApproval(t *testing.T) {
+	r := tools.NewRegistry()
+	executions := 0
+	r.Register(&testTool{
+		name: "bash",
+		execute: func(ctx context.Context, params json.RawMessage) (tools.Result, error) {
+			executions++
+			return tools.Result{Success: true, Output: "containers"}, nil
+		},
+	})
+	ps := permission.NewPermissionService(permission.PermLevelNormal, nil, nil)
+	c := &coordinator{
+		tools:       r,
+		permService: ps,
+		toolCaller:  tools.NewToolCaller(r, ps),
+		confirmFn:   func(toolName, arguments string) bool { return true },
+	}
+	call := ToolCall{ID: "call_1", Function: FunctionCall{Name: "bash", Arguments: `{"command":"docker ps"}`}}
+
+	results, err := c.handleToolCallsForSession(context.Background(), "s1", []ToolCall{call})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].Content != "containers" || executions != 1 {
+		t.Fatalf("expected confirmed command to execute once, results=%+v executions=%d", results, executions)
+	}
+	if !ps.IsOperationApproved("s1", "bash", json.RawMessage(call.Function.Arguments)) {
+		t.Fatal("expected confirmed operation to be cached")
+	}
+
+	c.confirmFn = func(toolName, arguments string) bool {
+		t.Fatalf("cached approval should not ask again")
+		return false
+	}
+	results, err = c.handleToolCallsForSession(context.Background(), "s1", []ToolCall{call})
+	if err != nil {
+		t.Fatalf("unexpected error on cached call: %v", err)
+	}
+	if len(results) != 1 || results[0].Content != "containers" || executions != 2 {
+		t.Fatalf("expected cached command to execute, results=%+v executions=%d", results, executions)
+	}
+}
+
+func TestRequestUserConfirmationDefaultsToDeny(t *testing.T) {
+	c := &coordinator{broker: &testBroker{}}
+	if c.requestUserConfirmation("bash", `{"command":"docker ps"}`) {
+		t.Fatal("default confirmation should fail closed")
 	}
 }
 
@@ -306,6 +363,62 @@ func TestCoordinatorPromptIncludesSkillMetadataOnly(t *testing.T) {
 	}
 	if !strings.Contains(agent.systemPrompt, filepath.Join(skillDir, skills.SkillFileName)) {
 		t.Fatalf("expected SKILL.md location in prompt:\n%s", agent.systemPrompt)
+	}
+}
+
+func TestCoordinatorPromptIncludesRulesAndTools(t *testing.T) {
+	projectDir := t.TempDir()
+	rulesDir := filepath.Join(projectDir, ".aicode")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ruleFile := filepath.Join(rulesDir, "rules.yaml")
+	content := `constitution:
+  - id: custom_safety
+    name: 自定义安全规则
+    description: 必须先说明风险
+    enabled: true
+coding:
+  - id: custom_style
+    name: 自定义风格规则
+    description: 使用短函数
+    enabled: true
+workflow:
+  - id: disabled_workflow
+    name: 禁用流程规则
+    description: 不应出现在提示词
+    enabled: false
+`
+	if err := os.WriteFile(ruleFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := tools.NewRegistry()
+	r.Register(&testTool{name: "view", description: "read file", execute: func(ctx context.Context, params json.RawMessage) (tools.Result, error) {
+		return tools.Result{Success: true}, nil
+	}})
+	c := &coordinator{
+		config: &config.Config{},
+		tools:  r,
+	}
+	agent := &sessionAgent{}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	c.loadSystemPrompt(config.AgentConfig{}, agent)
+	for _, want := range []string{"<critical_rules>", "自定义安全规则", "<code_conventions>", "自定义风格规则", "<tools>", "view", "read file"} {
+		if !strings.Contains(agent.systemPrompt, want) {
+			t.Fatalf("expected prompt to contain %q:\n%s", want, agent.systemPrompt)
+		}
+	}
+	if strings.Contains(agent.systemPrompt, "不应出现在提示词") {
+		t.Fatalf("disabled rule should be omitted:\n%s", agent.systemPrompt)
 	}
 }
 

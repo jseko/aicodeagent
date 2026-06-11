@@ -7,27 +7,56 @@ import (
 	"time"
 
 	"AICodeAgent/internal/permission"
+	"AICodeAgent/internal/rules"
 )
 
 const toolExecTimeout = 10 * time.Second
 
+// AuditLogger 轻量审计日志接口
+type AuditLogger interface {
+	LogSuccess(toolName string, params json.RawMessage)
+	LogRejection(toolName string, params json.RawMessage, reason string)
+}
+
 // ToolCaller 工具调用器，串联查找→鉴权→执行全流程
 type ToolCaller struct {
-	registry    *Registry
-	permService *permission.PermissionService
+	registry      *Registry
+	permService   *permission.PermissionService
+	bashFilter    *BashFilter
+	securityGuard *SecurityGuard
+	auditLogger   AuditLogger
 }
 
 // NewToolCaller 创建工具调用器
 func NewToolCaller(registry *Registry, permService *permission.PermissionService) *ToolCaller {
+	bashFilter := NewBashFilter()
 	return &ToolCaller{
-		registry:    registry,
-		permService: permService,
+		registry:      registry,
+		permService:   permService,
+		bashFilter:    bashFilter,
+		securityGuard: NewSecurityGuard(rules.DefaultConstitutionRules(), bashFilter, nil, nil),
 	}
 }
 
-// ResolveAndCheck 工具查找+权限检查（不含执行），供 handleToolCalls 和 CallTool 共享
+// SetAuditLogger 注入审计日志器（可选，失败不阻断操作）
+func (c *ToolCaller) SetAuditLogger(logger AuditLogger) { c.auditLogger = logger }
+
+// SetSecurityGuard 注入统一安全护栏，便于测试和扩展安全策略
+func (c *ToolCaller) SetSecurityGuard(guard *SecurityGuard) {
+	c.securityGuard = guard
+	if guard != nil && guard.bashFilter != nil {
+		c.bashFilter = guard.bashFilter
+	}
+}
+
+// ResolveAndCheck 工具查找+权限检查（不含执行），供旧调用方兼容使用
 // 返回值：tool（nil 表示未找到）、allow、needConfirm、reason
 func (c *ToolCaller) ResolveAndCheck(toolName string, params json.RawMessage) (Tool, bool, bool, string) {
+	return c.ResolveAndCheckForSession("", toolName, params)
+}
+
+// ResolveAndCheckForSession 工具查找+会话级权限检查
+func (c *ToolCaller) ResolveAndCheckForSession(sessionID, toolName string, params json.RawMessage) (Tool, bool, bool, string) {
 	tool, ok := c.registry.Get(toolName)
 	if !ok {
 		return nil, false, false, fmt.Sprintf("未知工具: %s", toolName)
@@ -35,8 +64,47 @@ func (c *ToolCaller) ResolveAndCheck(toolName string, params json.RawMessage) (T
 	if isAllowedSkillRead(toolName, tool, params) {
 		return tool, true, false, ""
 	}
+	if sessionID != "" && c.permService != nil && c.permService.IsOperationApproved(sessionID, toolName, params) {
+		return tool, true, false, ""
+	}
+
+	if err := c.checkConstitution(toolName, params); err != nil {
+		return tool, false, false, err.Error()
+	}
+
+	// Bash 安全过滤（第12章工具安全护栏）
+	if toolName == "bash" && c.bashFilter != nil {
+		var bp BashParams
+		if err := json.Unmarshal(params, &bp); err == nil {
+			result, reason := c.bashFilter.Check(bp.Command)
+			if result == FilterBlocked {
+				return tool, false, false, reason
+			}
+			if result == FilterGrey {
+				return tool, false, true, reason
+			}
+		}
+	}
+
+	if c.permService == nil {
+		return tool, true, false, ""
+	}
 	allow, needConfirm, reason := c.permService.Check(toolName, params)
 	return tool, allow, needConfirm, reason
+}
+
+func (c *ToolCaller) checkConstitution(toolName string, params json.RawMessage) error {
+	values := map[string]interface{}{}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &values)
+	}
+	guard := c.securityGuard
+	if guard == nil {
+		guard = NewSecurityGuard(rules.DefaultConstitutionRules(), c.bashFilter, nil, nil)
+		c.securityGuard = guard
+	}
+	op := &Operation{ToolName: toolName, Action: "execute", Params: values}
+	return guard.checkConstitution(op)
 }
 
 type skillReadAuthorizer interface {
@@ -63,11 +131,13 @@ func (c *ToolCaller) CallTool(ctx context.Context, sessionID, toolName string,
 	params json.RawMessage) (Result, error) {
 
 	// 1. 精确查找+权限检查（共享逻辑）
-	tool, allow, needConfirm, reason := c.ResolveAndCheck(toolName, params)
+	tool, allow, needConfirm, reason := c.ResolveAndCheckForSession(sessionID, toolName, params)
 	if tool == nil {
+		c.auditRejection(toolName, params, reason)
 		return Result{Success: false, Error: reason}, nil
 	}
 	if !allow {
+		c.auditRejection(toolName, params, reason)
 		if needConfirm {
 			return Result{Success: false, Error: "操作需要用户确认: " + reason}, nil
 		}
@@ -78,5 +148,28 @@ func (c *ToolCaller) CallTool(ctx context.Context, sessionID, toolName string,
 	execCtx, cancel := context.WithTimeout(ctx, toolExecTimeout)
 	defer cancel()
 
-	return tool.Execute(execCtx, params)
+	result, err := tool.Execute(execCtx, params)
+
+	// 审计日志（仅记录，失败不阻断操作）
+	c.auditToolResult(toolName, params, result)
+
+	return result, err
+}
+
+func (c *ToolCaller) auditRejection(toolName string, params json.RawMessage, reason string) {
+	if c.auditLogger == nil {
+		return
+	}
+	c.auditLogger.LogRejection(toolName, params, reason)
+}
+
+func (c *ToolCaller) auditToolResult(toolName string, params json.RawMessage, result Result) {
+	if c.auditLogger == nil {
+		return
+	}
+	if result.Success {
+		c.auditLogger.LogSuccess(toolName, params)
+	} else {
+		c.auditLogger.LogRejection(toolName, params, result.Error)
+	}
 }

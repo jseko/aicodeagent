@@ -21,12 +21,16 @@ type BashParams struct {
 // Bash 命令执行工具（受控沙箱）
 type Bash struct {
 	workingDir string
+	filter     *BashFilter
 }
 
 // NewBash 创建Bash工具实例
 func NewBash(workingDir string) *Bash {
-	return &Bash{workingDir: workingDir}
+	return &Bash{workingDir: workingDir, filter: NewBashFilter()}
 }
+
+// SetFilter 注入自定义过滤器（测试用）
+func (b *Bash) SetFilter(f *BashFilter) { b.filter = f }
 
 func (b *Bash) Name() string { return "bash" }
 func (b *Bash) Description() string {
@@ -55,6 +59,18 @@ func (b *Bash) Execute(ctx context.Context, params json.RawMessage) (Result, err
 
 	if p.Command == "" {
 		return Result{Success: false, Error: "命令不能为空"}, nil
+	}
+
+	// 安全过滤（二层防御）
+	if b.filter != nil {
+		result, reason := b.filter.Check(p.Command)
+		if result == FilterBlocked {
+			return Result{Success: false, Error: NewBannedCommandError(p.Command, reason).Error()}, nil
+		}
+		if result == FilterGrey {
+			return Result{Success: false, Error: (&ToolError{
+				Type: ErrNeedConfirmation, Message: "需要用户确认", Tool: "bash", Detail: reason}).Error()}, nil
+		}
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, bashTimeout)
