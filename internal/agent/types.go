@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 
 	"AICodeAgent/internal/llm"
 )
@@ -31,6 +33,31 @@ type SessionAgentCall struct {
 	Tools       []any         // 工具定义（OpenAI function format），传给LLM
 	Messages    []llm.Message // 对话历史（包含system prompt、历史消息、工具结果）
 }
+
+// SubagentInfo 子代理基本信息
+type SubagentInfo struct {
+	Name        string
+	Description string
+}
+
+type SubagentRunner interface {
+	List() []SubagentInfo
+	Execute(ctx context.Context, name string, session *Session, input string) (string, error)
+	Match(input string) (string, bool)
+}
+
+type SubagentExecutionObserver interface {
+	OnSubagentToolCall(ctx context.Context, parentSessionID, subagentName, callID, toolName string, params json.RawMessage)
+	OnSubagentToolResult(ctx context.Context, parentSessionID, subagentName, callID, toolName, result, errorText string)
+}
+
+type ObservableSubagentRunner interface {
+	SubagentRunner
+	SetObserver(observer SubagentExecutionObserver)
+}
+
+// ErrSubagentNotAvailable 子代理不可用
+var ErrSubagentNotAvailable = errors.New("subagent not available")
 
 // Model LLM模型配置
 type Model struct {

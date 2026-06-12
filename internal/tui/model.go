@@ -58,11 +58,18 @@ type Model struct {
 
 	// 权限确认状态
 	pendingConfirm *ConfirmationState
+
+	// Subagent 状态
+	subagentNames         []string
+	subagentRole          string
+	currentSubagentItem   *SubagentMessageItem
+	selectedSubagentIndex int
 }
 
 // ConfirmationState 权限确认请求的 TUI 状态
 type ConfirmationState struct {
 	RequestID string
+	SessionID string
 	ToolName  string
 	Command   string
 }
@@ -82,6 +89,10 @@ var builtInSlashSuggestions = []slashSuggestion{
 	{Command: "/initialize", Description: "扫描项目并生成 AGENTS.md 预览"},
 	{Command: "/initialize-confirm", Description: "确认写入上一次生成的 AGENTS.md"},
 	{Command: "/initialize-reject", Description: "放弃上一次生成的 AGENTS.md"},
+	{Command: "/subagent", Description: "调用指定 Subagent：/subagent <name> <task>"},
+	{Command: "/subagents", Description: "查看已加载的 Subagent 列表"},
+	{Command: "/skills", Description: "查看已加载的 Skills 列表"},
+	{Command: "/rules", Description: "查看已加载的 Rules 列表"},
 	{Command: "/undo", Description: "回滚到上一条用户消息"},
 	{Command: "/redo", Description: "恢复被回滚的消息"},
 }
@@ -126,6 +137,21 @@ func leadingSlashPrefix(input string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimPrefix(input, "/"), true
+}
+
+func (m Model) matchingSubagentNames(input string) []string {
+	parts := strings.SplitN(input, " ", 2)
+	if len(parts) != 2 || parts[0] != "/subagent" {
+		return nil
+	}
+	prefix := strings.ToLower(parts[1])
+	var matches []string
+	for _, name := range m.subagentNames {
+		if strings.HasPrefix(strings.ToLower(name), prefix) {
+			matches = append(matches, name)
+		}
+	}
+	return matches
 }
 
 func (m Model) clampSlashSuggestionIndex(input string, index int) int {
@@ -267,20 +293,31 @@ func New(a *app.App) Model {
 
 	skillSuggestions := append([]skills.SkillSuggestion(nil), a.SkillSuggestions...)
 
+	subagentNames := make([]string, 0)
+	if a.Subagents != nil {
+		for _, sub := range a.Subagents.List() {
+			if sub.Config != nil {
+				subagentNames = append(subagentNames, sub.Config.Name)
+			}
+		}
+	}
+
 	return Model{
-		app:               a,
-		pub:               a.Broker,
-		sub:               a.Broker,
-		sessionID:         "default",
-		skillSuggestions:  skillSuggestions,
-		messageItems:      []MessageItem{},
-		selectedToolIndex: -1,
-		input:             "",
-		ready:             false,
-		isLoading:         false,
-		statusMsg:         "",
-		styles:            s,
-		theme:             theme,
+		app:                   a,
+		pub:                   a.Broker,
+		sub:                   a.Broker,
+		sessionID:             "default",
+		skillSuggestions:      skillSuggestions,
+		messageItems:          []MessageItem{},
+		selectedToolIndex:     -1,
+		selectedSubagentIndex: -1,
+		input:                 "",
+		ready:                 false,
+		isLoading:             false,
+		statusMsg:             "",
+		subagentNames:         subagentNames,
+		styles:                s,
+		theme:                 theme,
 	}
 }
 
@@ -306,6 +343,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.isLoading {
 			return m, spinnerTick()
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		switch {
+		case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonWheelUp:
+			m.scrollPos += 3
+			m.wasAtBottom = false
+			return m, nil
+		case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonWheelDown:
+			m.scrollPos = max(0, m.scrollPos-3)
+			if m.scrollPos == 0 {
+				m.wasAtBottom = true
+			}
+			return m, nil
 		}
 		return m, nil
 
@@ -348,6 +400,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if msg.String() == "ctrl+e" {
+			if next, ok := m.toggleSelectedSubagentDetails(); ok {
+				return next, nil
+			}
 			if next, ok := m.toggleSelectedToolDetails(); ok {
 				return next, nil
 			}
@@ -372,6 +427,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEnter:
 			if strings.TrimSpace(m.input) == "" {
+				if next, ok := m.toggleSelectedSubagentDetails(); ok {
+					return next, nil
+				}
 				if next, ok := m.toggleSelectedToolDetails(); ok {
 					return next, nil
 				}
@@ -449,6 +507,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeySpace:
 			if m.input == "" {
+				if next, ok := m.toggleSelectedSubagentDetails(); ok {
+					return next, nil
+				}
 				if next, ok := m.toggleSelectedToolDetails(); ok {
 					return next, nil
 				}
@@ -587,10 +648,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case events.PermissionRequest:
 		m.pendingConfirm = &ConfirmationState{
 			RequestID: msg.RequestID,
+			SessionID: msg.SessionID,
 			ToolName:  msg.ToolName,
 			Command:   msg.Command,
 		}
 		m.statusMsg = fmt.Sprintf("确认执行 %s? [y]允许一次 [a]会话允许 [n]拒绝", msg.ToolName)
+		return m, nil
+
+	case events.SubagentRoleSwitch:
+		m.subagentRole = msg.SubagentName
+		msgID := fmt.Sprintf("msg-%d", m.msgIDSeq)
+		m.msgIDSeq++
+		item := NewSubagentMessageItem(&Message{
+			ID:      msgID,
+			Role:    "subagent",
+			Content: msg.SubagentName,
+		}, msg.SubagentName, m.styles)
+		m.messageItems = append(m.messageItems, item)
+		m.currentSubagentItem = item
+		m.selectedSubagentIndex = len(m.messageItems) - 1
+		m.statusMsg = "Subagent: " + msg.SubagentName
+		return m, nil
+
+	case events.SubagentToolCall:
+		item := m.subagentItemFor(msg.SubagentName)
+		if item != nil {
+			item.AddToolCall(msg.ToolCallID, msg.ToolName, string(msg.Params))
+			m.selectedSubagentIndex = m.latestExpandableSubagentIndex()
+		}
+		m.statusMsg = "Subagent tool: " + msg.ToolName
+		return m, nil
+
+	case events.SubagentToolResult:
+		item := m.subagentItemFor(msg.SubagentName)
+		if item != nil {
+			item.SetToolResult(msg.ToolCallID, msg.ToolName, msg.Result, msg.Error)
+			m.selectedSubagentIndex = m.latestExpandableSubagentIndex()
+		}
+		m.statusMsg = "Subagent tool done: " + msg.ToolName
+		return m, nil
+
+	case events.SubagentTaskComplete:
+		item := m.subagentItemFor(msg.SubagentName)
+		if item != nil {
+			item.SetSummary(msg.Summary, msg.Error)
+			m.selectedSubagentIndex = m.latestExpandableSubagentIndex()
+		}
+		if msg.Error != "" {
+			m.statusMsg = msg.Error
+		} else {
+			m.statusMsg = "Subagent 完成: " + msg.SubagentName
+		}
+		return m, nil
+
+	case events.SubagentRoleRestore:
+		m.subagentRole = ""
+		m.currentSubagentItem = nil
 		return m, nil
 	}
 
@@ -683,6 +796,49 @@ func (m Model) toggleSelectedToolDetails() (Model, bool) {
 	return m, true
 }
 
+func (m Model) latestExpandableSubagentIndex() int {
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		if item, ok := m.messageItems[i].(*SubagentMessageItem); ok && (item.summary != "" || item.errorText != "" || len(item.tools) > 0) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m Model) expandedSubagentIndex() int {
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		if item, ok := m.messageItems[i].(*SubagentMessageItem); ok && item.expanded {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m Model) toggleSelectedSubagentDetails() (Model, bool) {
+	index := m.expandedSubagentIndex()
+	if index < 0 {
+		index = m.selectedSubagentIndex
+	}
+	if index < 0 || index >= len(m.messageItems) {
+		index = m.latestExpandableSubagentIndex()
+	}
+	if index < 0 {
+		return m, false
+	}
+	item, ok := m.messageItems[index].(*SubagentMessageItem)
+	if !ok {
+		return m, false
+	}
+	item.ToggleContent()
+	m.selectedSubagentIndex = index
+	if item.expanded {
+		m.statusMsg = "已展开 Subagent 执行详情: " + item.name
+	} else {
+		m.statusMsg = "已收起 Subagent 执行详情: " + item.name
+	}
+	return m, true
+}
+
 // View 渲染界面 — 使用 MessageItem 接口委托渲染
 func (m Model) View() string {
 	if !m.ready {
@@ -708,29 +864,18 @@ func (m Model) View() string {
 		contentWidth = 20
 	}
 
-	// 智能滚动：计算可见范围（例9-5）
-	maxVisible := max(1, m.height-8)
-	visibleStart := max(0, len(m.messageItems)-maxVisible-m.scrollPos)
-	visibleEnd := len(m.messageItems) - m.scrollPos
-	if visibleEnd > len(m.messageItems) {
-		visibleEnd = len(m.messageItems)
-	}
-	if visibleStart >= visibleEnd {
-		visibleStart = max(0, visibleEnd-1)
-	}
-
-	// 向上滚动提示
-	if m.scrollPos > 0 {
+	messageView := renderVisibleMessageLines(m.messageItems, contentWidth, max(1, m.height-8), m.scrollPos)
+	if messageView.hiddenBelow > 0 {
 		scrollHint := lipgloss.NewStyle().
 			Foreground(s.FgSubtle).
 			PaddingLeft(2).
-			Render(fmt.Sprintf("↑ %d messages below (End键回到最新)", m.scrollPos))
+			Render(fmt.Sprintf("↑ %d lines below (End键回到最新)", messageView.hiddenBelow))
 		b.WriteString(scrollHint)
 		b.WriteString("\n")
 	}
 
-	for _, item := range m.messageItems[visibleStart:visibleEnd] {
-		b.WriteString(item.Render(contentWidth))
+	if messageView.content != "" {
+		b.WriteString(messageView.content)
 		b.WriteString("\n")
 	}
 
@@ -779,6 +924,15 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
+	if m.subagentRole != "" {
+		roleStyle := lipgloss.NewStyle().
+			Foreground(s.Primary).
+			Bold(true).
+			PaddingLeft(2)
+		b.WriteString(roleStyle.Render("Subagent: " + m.subagentRole))
+		b.WriteString("\n")
+	}
+
 	// 命令提示区
 	if !m.isLoading {
 		matches := m.matchingSlashSuggestions(m.input)
@@ -805,6 +959,21 @@ func (m Model) View() string {
 				b.WriteString("\n")
 			}
 		}
+
+		subagentMatches := m.matchingSubagentNames(m.input)
+		if len(subagentMatches) > 0 {
+			hintStyle := lipgloss.NewStyle().
+				Foreground(s.FgMuted).
+				PaddingLeft(2)
+
+			b.WriteString("\n")
+			b.WriteString(hintStyle.Render("Subagents:"))
+			b.WriteString("\n")
+			for _, name := range subagentMatches {
+				b.WriteString(hintStyle.Render("  " + name))
+				b.WriteString("\n")
+			}
+		}
 	}
 
 	// 输入区
@@ -817,6 +986,55 @@ func (m Model) View() string {
 	b.WriteString(inputStyle.Render(m.renderedInputLine()))
 
 	return b.String()
+}
+
+func (m *Model) subagentItemFor(name string) *SubagentMessageItem {
+	if m.currentSubagentItem != nil && m.currentSubagentItem.name == name {
+		return m.currentSubagentItem
+	}
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		item, ok := m.messageItems[i].(*SubagentMessageItem)
+		if ok && item.name == name {
+			return item
+		}
+	}
+	return nil
+}
+
+type renderedMessageView struct {
+	content     string
+	hiddenBelow int
+}
+
+func renderVisibleMessageLines(items []MessageItem, width, maxVisible, scrollPos int) renderedMessageView {
+	if len(items) == 0 || maxVisible <= 0 {
+		return renderedMessageView{}
+	}
+
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		rendered := strings.TrimRight(item.Render(width), "\n")
+		if rendered == "" {
+			continue
+		}
+		lines = append(lines, strings.Split(rendered, "\n")...)
+	}
+	if len(lines) == 0 {
+		return renderedMessageView{}
+	}
+
+	scrollPos = max(0, scrollPos)
+	maxScroll := max(0, len(lines)-maxVisible)
+	if scrollPos > maxScroll {
+		scrollPos = maxScroll
+	}
+
+	end := len(lines) - scrollPos
+	start := max(0, end-maxVisible)
+	return renderedMessageView{
+		content:     strings.Join(lines[start:end], "\n"),
+		hiddenBelow: scrollPos,
+	}
 }
 
 // ListenEvents 在独立 goroutine 中订阅事件，转换为 tea.Msg
@@ -845,7 +1063,7 @@ func Start(a *app.App) error {
 	}
 
 	ui := NewUI(a)
-	p := tea.NewProgram(ui)
+	p := tea.NewProgram(ui, tea.WithMouseCellMotion())
 
 	ctx, cancel := context.WithCancel(a.Ctx)
 	defer cancel()

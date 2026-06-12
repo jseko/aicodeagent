@@ -23,6 +23,21 @@ func newSlashTestModel(skillSuggestions []skills.SkillSuggestion) Model {
 	return model
 }
 
+func TestModelMouseWheelScrollsMessages(t *testing.T) {
+	model := newSlashTestModel(nil)
+	updated, _ := model.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+	m := updated.(Model)
+	if m.scrollPos != 3 || m.wasAtBottom {
+		t.Fatalf("wheel up should scroll away from bottom: scroll=%d bottom=%v", m.scrollPos, m.wasAtBottom)
+	}
+
+	updated, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	if m.scrollPos != 0 || !m.wasAtBottom {
+		t.Fatalf("wheel down should return to bottom: scroll=%d bottom=%v", m.scrollPos, m.wasAtBottom)
+	}
+}
+
 func TestModelSlashSuggestionsOpenAndFilterSkills(t *testing.T) {
 	model := newSlashTestModel([]skills.SkillSuggestion{
 		{Command: "/code-review", Name: "code-review", Description: "Review code."},
@@ -41,6 +56,21 @@ func TestModelSlashSuggestionsOpenAndFilterSkills(t *testing.T) {
 	}
 	if matches[0].Command != "/code-review" || matches[1].Command != "/commit" {
 		t.Fatalf("unexpected filtered suggestions: %+v", matches)
+	}
+}
+
+func TestModelSlashSuggestionsIncludeManagementCommands(t *testing.T) {
+	model := newSlashTestModel(nil)
+	matches := model.matchingSlashSuggestions("/")
+
+	commands := make(map[string]bool, len(matches))
+	for _, item := range matches {
+		commands[item.Command] = true
+	}
+	for _, want := range []string{"/subagent", "/subagents", "/skills", "/rules"} {
+		if !commands[want] {
+			t.Fatalf("expected %s in slash suggestions, got %+v", want, matches)
+		}
 	}
 }
 
@@ -231,5 +261,40 @@ func TestModelRenderedInputCursorFollowsMovement(t *testing.T) {
 	}
 	if !strings.Contains(got, "abcd") {
 		t.Fatalf("expected rendered input text to remain intact, got %q", got)
+	}
+}
+
+func TestModelViewClampsScrollPastMessages(t *testing.T) {
+	model := newSlashTestModel(nil)
+	model.messageItems = []MessageItem{NewSystemMessageItem(&Message{ID: "msg-1", Role: "system", Content: "ready"}, model.styles)}
+	model.scrollPos = len(model.messageItems) + 5
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("View should not panic when scrollPos exceeds messages: %v", r)
+		}
+	}()
+
+	view := model.View()
+	if !strings.Contains(view, "AICodeAgent") {
+		t.Fatalf("expected rendered view, got %q", view)
+	}
+}
+
+func TestRenderVisibleMessageLinesScrollsWithinLongMessage(t *testing.T) {
+	model := newSlashTestModel(nil)
+	items := []MessageItem{NewSystemMessageItem(&Message{ID: "msg-1", Role: "system", Content: "line1\nline2\nline3\nline4\nline5"}, model.styles)}
+
+	bottom := renderVisibleMessageLines(items, 80, 3, 0)
+	if strings.Contains(bottom.content, "line1") || !strings.Contains(bottom.content, "line5") {
+		t.Fatalf("expected bottom window to show latest lines, got %q", bottom.content)
+	}
+
+	scrolled := renderVisibleMessageLines(items, 80, 3, 2)
+	if !strings.Contains(scrolled.content, "line1") || strings.Contains(scrolled.content, "line5") {
+		t.Fatalf("expected scrolled window to show earlier lines, got %q", scrolled.content)
+	}
+	if scrolled.hiddenBelow != 2 {
+		t.Fatalf("expected 2 hidden lines below, got %d", scrolled.hiddenBelow)
 	}
 }

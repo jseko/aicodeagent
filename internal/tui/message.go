@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -339,6 +340,225 @@ func (t *ToolMessageItem) SetResult(content string) {
 func (t *ToolMessageItem) ToggleContent() {
 	t.expandedContent = !t.expandedContent
 	t.invalidateCache()
+}
+
+// SystemMessageItem 系统消息渲染（subagent 生命周期等）
+type SubagentToolStep struct {
+	ID       string
+	Name     string
+	Params   string
+	Result   string
+	Error    string
+	Complete bool
+}
+
+// SubagentMessageItem 渲染子代理执行树，默认折叠，按键可展开。
+type SubagentMessageItem struct {
+	*cachedMessageItem
+	message    *Message
+	styles     *Styles
+	name       string
+	summary    string
+	errorText  string
+	expanded   bool
+	completed  bool
+	tools      []SubagentToolStep
+	mdRenderer *MarkdownRenderer
+}
+
+func NewSubagentMessageItem(msg *Message, name string, styles *Styles) *SubagentMessageItem {
+	return &SubagentMessageItem{
+		cachedMessageItem: &cachedMessageItem{},
+		message:           msg,
+		styles:            styles,
+		name:              name,
+		expanded:          false,
+	}
+}
+
+func (s *SubagentMessageItem) ID() string { return s.message.ID }
+
+func (s *SubagentMessageItem) Render(width int) string {
+	if cached, ok := s.getCachedRender(width); ok {
+		return cached
+	}
+	contentWidth := max(10, width-4)
+	toggle := "▶"
+	if s.expanded {
+		toggle = "▼"
+	}
+	status := "运行中"
+	if s.completed && s.errorText == "" {
+		status = "完成"
+	} else if s.completed {
+		status = "失败"
+	}
+	header := lipgloss.NewStyle().Bold(true).Render(toggle + " Subagent: " + s.name + " · " + status)
+	sections := []string{header}
+
+	if !s.expanded {
+		sections = append(sections, s.collapsedPreview())
+	} else {
+		sections = append(sections, s.expandedBody(contentWidth))
+	}
+
+	result := s.styles.Chat.ToolMsg.Width(width).Render(strings.Join(sections, "\n"))
+	s.setCache(result, width)
+	return result
+}
+
+func (s *SubagentMessageItem) collapsedPreview() string {
+	lines := make([]string, 0, len(s.tools)+2)
+	for _, tool := range s.tools {
+		icon := "●"
+		if tool.Complete && tool.Error == "" {
+			icon = "✓"
+		} else if tool.Complete {
+			icon = "✗"
+		}
+		lines = append(lines, "  ├── "+icon+" "+tool.Name)
+	}
+	if s.summary != "" {
+		lines = append(lines, "  ╰── 摘要已生成")
+	} else if s.completed && s.errorText != "" {
+		lines = append(lines, "  ╰── 执行失败")
+	} else {
+		lines = append(lines, "  ╰── 等待结果")
+	}
+	lines = append(lines, "  (按 Ctrl+E 展开/收起；空闲时 Enter/Space 也可切换)")
+	return lipgloss.NewStyle().Foreground(s.styles.FgSubtle).Render(strings.Join(lines, "\n"))
+}
+
+func (s *SubagentMessageItem) expandedBody(width int) string {
+	var sections []string
+	for i, tool := range s.tools {
+		prefix := "├──"
+		if i == len(s.tools)-1 && s.summary == "" && s.errorText == "" {
+			prefix = "╰──"
+		}
+		sections = append(sections, lipgloss.NewStyle().Bold(true).Render("  "+prefix+" "+tool.Name))
+		if tool.Params != "" {
+			sections = append(sections, indentSubagentBlock("参数: "+tool.Params, 6))
+		}
+		if tool.Result != "" {
+			sections = append(sections, indentSubagentBlock(limitLines(tool.Result, 20), 6))
+		}
+	}
+	if s.errorText != "" {
+		sections = append(sections, lipgloss.NewStyle().Foreground(s.styles.Error).Render("  ╰── "+s.errorText))
+	} else if s.summary != "" {
+		sections = append(sections, lipgloss.NewStyle().Bold(true).Render("  ╰── 最终总结"))
+		sections = append(sections, indentSubagentBlock(s.renderMarkdown(s.summary, width-6), 6))
+	}
+	return strings.Join(sections, "\n")
+}
+
+func (s *SubagentMessageItem) renderMarkdown(content string, width int) string {
+	r, err := getGlamourRenderer(width)
+	if err != nil {
+		return content
+	}
+	rendered, err := r.Render(content)
+	if err != nil {
+		return content
+	}
+	return rendered
+}
+
+func (s *SubagentMessageItem) Height(width int) int {
+	rendered := s.Render(width)
+	return strings.Count(rendered, "\n") + 1
+}
+
+func (s *SubagentMessageItem) AddToolCall(id, name, params string) {
+	for i := range s.tools {
+		if s.tools[i].ID == id {
+			s.tools[i].Name = name
+			s.tools[i].Params = params
+			s.invalidateCache()
+			return
+		}
+	}
+	s.tools = append(s.tools, SubagentToolStep{ID: id, Name: name, Params: params})
+	s.invalidateCache()
+}
+
+func (s *SubagentMessageItem) SetToolResult(id, name, result, errorText string) {
+	for i := range s.tools {
+		if s.tools[i].ID == id {
+			s.tools[i].Name = name
+			s.tools[i].Result = result
+			s.tools[i].Error = errorText
+			s.tools[i].Complete = true
+			s.invalidateCache()
+			return
+		}
+	}
+	s.tools = append(s.tools, SubagentToolStep{ID: id, Name: name, Result: result, Error: errorText, Complete: true})
+	s.invalidateCache()
+}
+
+func (s *SubagentMessageItem) SetSummary(summary, errorText string) {
+	s.summary = summary
+	s.errorText = errorText
+	s.completed = true
+	s.invalidateCache()
+}
+
+func (s *SubagentMessageItem) ToggleContent() {
+	s.expanded = !s.expanded
+	s.invalidateCache()
+}
+
+func indentSubagentBlock(content string, spaces int) string {
+	padding := strings.Repeat(" ", spaces)
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = padding + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func limitLines(content string, maxLines int) string {
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[:maxLines], "\n") + fmt.Sprintf("\n... (%d lines hidden)", len(lines)-maxLines)
+}
+
+type SystemMessageItem struct {
+	*cachedMessageItem
+	message *Message
+	styles  *Styles
+}
+
+func NewSystemMessageItem(msg *Message, styles *Styles) *SystemMessageItem {
+	return &SystemMessageItem{
+		cachedMessageItem: &cachedMessageItem{},
+		message:           msg,
+		styles:            styles,
+	}
+}
+
+func (s *SystemMessageItem) ID() string { return s.message.ID }
+
+func (s *SystemMessageItem) Render(width int) string {
+	if cached, ok := s.getCachedRender(width); ok {
+		return cached
+	}
+	style := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#888888")).
+		Italic(true).
+		PaddingLeft(2)
+	result := style.Render("[系统] " + s.message.Content)
+	s.setCache(result, width)
+	return result
+}
+
+func (s *SystemMessageItem) Height(width int) int {
+	rendered := s.Render(width)
+	return strings.Count(rendered, "\n") + 1
 }
 
 // wrapText 简单文本换行（用于用户消息等纯文本场景）

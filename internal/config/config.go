@@ -21,6 +21,7 @@ type Config struct {
 	Permission    PermissionConfig     `yaml:"permission"`
 	SummaryPrompt string               `yaml:"summary_prompt"`
 	MCP           map[string]MCPConfig `yaml:"mcp"`
+	Subagents     SubagentsConfig      `yaml:"subagents"`
 }
 
 type OpenAI struct {
@@ -98,6 +99,11 @@ type MCPConfig struct {
 	DisabledTools []string          `yaml:"disabled_tools"` // 禁用的工具列表
 	Env           map[string]string `yaml:"env"`            // 环境变量
 	Headers       map[string]string `yaml:"headers"`        // HTTP 头（http/sse 模式）
+}
+
+type SubagentsConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	AgenticEnabled bool `yaml:"agentic_enabled"`
 }
 
 func (c *Config) ResolveSecret(secretRef string) string {

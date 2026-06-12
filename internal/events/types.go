@@ -10,15 +10,20 @@ import (
 type EventType string
 
 const (
-	TypeUserMessage        EventType = "user.message"
-	TypeAgentThink         EventType = "agent.think"
-	TypeToolCall           EventType = "tool.call"
-	TypeToolResult         EventType = "tool.result"
-	TypeSessionUpdate      EventType = "session.update"
-	TypeCancelTask         EventType = "task.cancel"
-	TypeError              EventType = "error"
-	TypePermissionRequest  EventType = "permission.request"
-	TypePermissionResponse EventType = "permission.response"
+	TypeUserMessage          EventType = "user.message"
+	TypeAgentThink           EventType = "agent.think"
+	TypeToolCall             EventType = "tool.call"
+	TypeToolResult           EventType = "tool.result"
+	TypeSessionUpdate        EventType = "session.update"
+	TypeCancelTask           EventType = "task.cancel"
+	TypeError                EventType = "error"
+	TypePermissionRequest    EventType = "permission.request"
+	TypePermissionResponse   EventType = "permission.response"
+	TypeSubagentRoleSwitch   EventType = "subagent.role.switch"
+	TypeSubagentRoleRestore  EventType = "subagent.role.restore"
+	TypeSubagentToolCall     EventType = "subagent.tool.call"
+	TypeSubagentToolResult   EventType = "subagent.tool.result"
+	TypeSubagentTaskComplete EventType = "subagent.task.complete"
 )
 
 // Event 基础事件接口
@@ -130,3 +135,63 @@ type PermissionResponse struct {
 
 func (e PermissionResponse) Type() EventType      { return TypePermissionResponse }
 func (e PermissionResponse) Timestamp() time.Time { return e.Time }
+
+// SubagentRoleSwitch 子代理角色切换事件
+type SubagentRoleSwitch struct {
+	ParentSessionID string    `json:"parent_session_id"`
+	SubagentName    string    `json:"subagent_name"`
+	ChildSessionID  string    `json:"child_session_id"`
+	Time            time.Time `json:"time"`
+}
+
+func (e SubagentRoleSwitch) Type() EventType      { return TypeSubagentRoleSwitch }
+func (e SubagentRoleSwitch) Timestamp() time.Time { return e.Time }
+
+// SubagentRoleRestore 子代理角色恢复事件
+type SubagentRoleRestore struct {
+	ParentSessionID string    `json:"parent_session_id"`
+	SubagentName    string    `json:"subagent_name"`
+	Time            time.Time `json:"time"`
+}
+
+func (e SubagentRoleRestore) Type() EventType      { return TypeSubagentRoleRestore }
+func (e SubagentRoleRestore) Timestamp() time.Time { return e.Time }
+
+// SubagentToolCall 子代理内部工具调用事件
+type SubagentToolCall struct {
+	ParentSessionID string          `json:"parent_session_id"`
+	SubagentName    string          `json:"subagent_name"`
+	ToolCallID      string          `json:"tool_call_id"`
+	ToolName        string          `json:"tool_name"`
+	Params          json.RawMessage `json:"params"`
+	Time            time.Time       `json:"time"`
+}
+
+func (e SubagentToolCall) Type() EventType      { return TypeSubagentToolCall }
+func (e SubagentToolCall) Timestamp() time.Time { return e.Time }
+
+// SubagentToolResult 子代理内部工具结果事件
+type SubagentToolResult struct {
+	ParentSessionID string    `json:"parent_session_id"`
+	SubagentName    string    `json:"subagent_name"`
+	ToolCallID      string    `json:"tool_call_id"`
+	ToolName        string    `json:"tool_name"`
+	Result          string    `json:"result"`
+	Error           string    `json:"error"`
+	Time            time.Time `json:"time"`
+}
+
+func (e SubagentToolResult) Type() EventType      { return TypeSubagentToolResult }
+func (e SubagentToolResult) Timestamp() time.Time { return e.Time }
+
+// SubagentTaskComplete 子代理任务完成事件
+type SubagentTaskComplete struct {
+	ParentSessionID string    `json:"parent_session_id"`
+	SubagentName    string    `json:"subagent_name"`
+	Summary         string    `json:"summary"`
+	Error           string    `json:"error"`
+	Time            time.Time `json:"time"`
+}
+
+func (e SubagentTaskComplete) Type() EventType      { return TypeSubagentTaskComplete }
+func (e SubagentTaskComplete) Timestamp() time.Time { return e.Time }

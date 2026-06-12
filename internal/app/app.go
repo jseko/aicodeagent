@@ -16,6 +16,7 @@ import (
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
 	"AICodeAgent/internal/skills"
+	"AICodeAgent/internal/subagent"
 )
 
 // App 依赖注入容器，管理所有共享组件
@@ -31,6 +32,10 @@ type App struct {
 	PermService      *permission.PermissionService
 	Broker           *pubsub.Broker[events.Event]
 	SkillSuggestions []skills.SkillSuggestion
+
+	Subagents      *subagent.SubagentRegistry
+	SubagentCoord  *subagent.SubagentCoordinator
+	SubagentRunner *subagent.RunnerAdapter
 }
 
 // New 创建 App 实例并初始化所有组件
@@ -100,6 +105,22 @@ func New(ctx context.Context, cfg *config.Config) *App {
 	}
 	skillSuggestions := skills.NewSkillSuggestions(skillManager.List())
 
+	// 初始化 Subagent 注册表和协调器
+	subagentRegistry := subagent.NewRegistry()
+	if err := subagent.RegisterBuiltins(subagentRegistry); err != nil {
+		logger.Warn("加载内置 subagent 失败", "error", err)
+	}
+	subagentCoord := subagent.NewCoordinator(subagentRegistry)
+	if cfg.Subagents.Enabled {
+		loader := subagent.NewLoader(".", subagentRegistry, logger)
+		if err := loader.LoadSubagents(); err != nil {
+			logger.Warn("加载 subagent 配置失败", "error", err)
+		}
+	}
+
+	subagentRunner := subagent.NewRunnerAdapter(subagentRegistry, subagentCoord, toolRegistry, 2, coordinator.SessionAgent)
+	coordinator.SetSubagentRunner(subagentRunner)
+
 	app := &App{
 		Ctx:              appCtx,
 		Cancel:           cancel,
@@ -111,6 +132,9 @@ func New(ctx context.Context, cfg *config.Config) *App {
 		PermService:      permService,
 		Broker:           broker,
 		SkillSuggestions: skillSuggestions,
+		Subagents:        subagentRegistry,
+		SubagentCoord:    subagentCoord,
+		SubagentRunner:   subagentRunner,
 	}
 
 	// 后台初始化 MCP 工具

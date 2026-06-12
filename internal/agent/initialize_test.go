@@ -1,11 +1,40 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"AICodeAgent/internal/events"
+	"AICodeAgent/internal/pubsub"
 )
+
+func TestNormalizeSubagentTaskPathTrimsWorkspacePrefix(t *testing.T) {
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	workspaceName := filepath.Base(oldWd)
+	parent := filepath.Join("parent", "nested")
+	root := filepath.Join(t.TempDir(), parent, workspaceName)
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer os.Chdir(oldWd)
+
+	want := filepath.Join("internal", "agent", "coordinator.go")
+	writeProjectMemoryFile(t, root, want, "package agent")
+	task := filepath.ToSlash(filepath.Join(parent, workspaceName, want))
+	got := normalizeSubagentTaskPath(task)
+	if got != want {
+		t.Fatalf("normalized task = %q, want %q", got, want)
+	}
+}
 
 func TestScanProjectStructureFindsKnownFiles(t *testing.T) {
 	root := t.TempDir()
@@ -185,6 +214,11 @@ func TestHandleBuiltinCommandRoutesCorrectly(t *testing.T) {
 		{name: "initialize with args", prompt: "/initialize my project", handled: true},
 		{name: "confirm", prompt: "/initialize-confirm", handled: true},
 		{name: "reject", prompt: "/initialize-reject", handled: true},
+		{name: "subagent list", prompt: "/subagents", handled: true},
+		{name: "subagent usage", prompt: "/subagent", handled: true},
+		{name: "subagent run", prompt: "/subagent reviewer check code", handled: true},
+		{name: "skills", prompt: "/skills", handled: true},
+		{name: "rules", prompt: "/rules", handled: true},
 		{name: "normal message", prompt: "hello", handled: false},
 		{name: "not a command", prompt: "just some /text", handled: false},
 	}
@@ -266,5 +300,97 @@ func TestBuildInitPromptWithTruncation(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "truncated") {
 		t.Error("prompt should indicate truncation")
+	}
+}
+
+type fakeSubagentRunner struct {
+	result string
+}
+
+func (r fakeSubagentRunner) List() []SubagentInfo              { return nil }
+func (r fakeSubagentRunner) Match(input string) (string, bool) { return "", false }
+func (r fakeSubagentRunner) Execute(ctx context.Context, name string, session *Session, input string) (string, error) {
+	return r.result, nil
+}
+
+type fakeSessionService struct {
+	session *Session
+}
+
+func (s *fakeSessionService) Get(ctx context.Context, id string) (*Session, error) {
+	if s.session != nil && s.session.ID == id {
+		return s.session, nil
+	}
+	return nil, os.ErrNotExist
+}
+func (s *fakeSessionService) Create(ctx context.Context, title string) (*Session, error) {
+	s.session = &Session{ID: "session-created", Title: title}
+	return s.session, nil
+}
+func (s *fakeSessionService) Save(ctx context.Context, session *Session) error {
+	s.session = session
+	return nil
+}
+func (s *fakeSessionService) List(ctx context.Context) ([]*Session, error) {
+	return []*Session{s.session}, nil
+}
+func (s *fakeSessionService) Delete(ctx context.Context, id string) error {
+	s.session = nil
+	return nil
+}
+
+type fakeMessageService struct {
+	created []CreateMessageParams
+}
+
+func (m *fakeMessageService) List(ctx context.Context, sessionID string) ([]Message, error) {
+	return nil, nil
+}
+func (m *fakeMessageService) Create(ctx context.Context, sessionID string, params CreateMessageParams) (*Message, error) {
+	m.created = append(m.created, params)
+	return &Message{ID: params.ID, Role: params.Role, Content: params.Content}, nil
+}
+
+func TestRunSubagentCommandPublishesLifecycleAndPersistsResult(t *testing.T) {
+	broker := pubsub.NewBroker[events.Event]()
+	ch := broker.Subscribe(context.Background())
+	sessions := &fakeSessionService{session: &Session{ID: "session-1"}}
+	messages := &fakeMessageService{}
+	c := &coordinator{
+		sessions:   sessions,
+		messages:   messages,
+		broker:     broker,
+		subagents:  fakeSubagentRunner{result: "audit done"},
+		sessionIDs: map[string]string{"default": "session-1"},
+	}
+
+	result, handled := c.runSubagentCommand(context.Background(), "default", "/subagent security-auditor internal/agent/coordinator.go")
+	if !handled {
+		t.Fatal("expected subagent command to be handled")
+	}
+	if result.Response != "audit done" {
+		t.Fatalf("unexpected result: %q", result.Response)
+	}
+	if len(messages.created) != 2 {
+		t.Fatalf("expected user and assistant messages to be persisted, got %d", len(messages.created))
+	}
+	if messages.created[0].Role != RoleUser || messages.created[1].Role != RoleAssistant {
+		t.Fatalf("unexpected persisted roles: %+v", messages.created)
+	}
+
+	var sawSwitch, sawRestore, sawComplete bool
+	for i := 0; i < 3; i++ {
+		event := <-ch
+		switch event.(type) {
+		case events.SubagentRoleSwitch:
+			sawSwitch = true
+		case events.SubagentRoleRestore:
+			sawRestore = true
+		case events.SubagentTaskComplete:
+			sawComplete = true
+		}
+	}
+	if !sawSwitch || !sawRestore || !sawComplete {
+		t.Fatalf("expected switch, complete and restore events, switch=%v complete=%v restore=%v", sawSwitch, sawComplete, sawRestore)
 	}
 }

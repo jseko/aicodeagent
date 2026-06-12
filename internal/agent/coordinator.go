@@ -38,9 +38,11 @@ type Coordinator interface {
 	IsBusy() bool
 	Summarize(ctx context.Context, sessionID string) error
 	Model() *Model
+	SessionAgent() SessionAgent
 	UpdateModels(ctx context.Context) error
 	HandleUserMessage(msg events.UserMessage)
 	PublishToolResult(result events.ToolResult)
+	SetSubagentRunner(runner SubagentRunner)
 	Undo(ctx context.Context, sessionID string) error
 	Redo(ctx context.Context, sessionID string) error
 }
@@ -63,6 +65,7 @@ type coordinator struct {
 	skills       *skills.Manager
 	rulesLoader  *rules.Loader
 	matcher      *SkillMatcher
+	subagents    SubagentRunner
 	confirmFn    func(toolName, arguments string) bool // 可注入的确认回调，测试用
 	pendingInit  *initializeResult                     // 待确认的 /initialize 结果
 	sub          pubsub.Subscriber[events.Event]
@@ -408,6 +411,10 @@ func (c *coordinator) selectModel(complexity float64) *Model {
 // Model 获取当前使用的大模型
 func (c *coordinator) Model() *Model {
 	return c.largeModel.Load()
+}
+
+func (c *coordinator) SessionAgent() SessionAgent {
+	return c.currentAgent
 }
 
 // UpdateModels 更新模型配置（运行时热更新）
@@ -909,6 +916,15 @@ func (c *coordinator) listenConfirmations() {
 }
 
 // Cancel 取消指定会话
+func (c *coordinator) SetSubagentRunner(runner SubagentRunner) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if observable, ok := runner.(ObservableSubagentRunner); ok {
+		observable.SetObserver(c)
+	}
+	c.subagents = runner
+}
+
 func (c *coordinator) Cancel(sessionID string) {
 	c.mu.RLock()
 	cancel, ok := c.running[sessionID]
@@ -1021,11 +1037,17 @@ func (c *coordinator) handleStopCondition(ctx context.Context, sessionID string,
 }
 
 func isBuiltinCommand(input string) bool {
-	return strings.HasPrefix(input, "/initialize-confirm") ||
-		strings.HasPrefix(input, "/initialize-reject") ||
-		strings.HasPrefix(input, "/initialize") ||
-		strings.HasPrefix(input, "/undo") ||
-		strings.HasPrefix(input, "/redo")
+	trimmed := strings.TrimSpace(input)
+	return strings.HasPrefix(trimmed, "/initialize-confirm") ||
+		strings.HasPrefix(trimmed, "/initialize-reject") ||
+		strings.HasPrefix(trimmed, "/initialize") ||
+		strings.HasPrefix(trimmed, "/subagents") ||
+		strings.HasPrefix(trimmed, "/skills") ||
+		strings.HasPrefix(trimmed, "/rules") ||
+		strings.HasPrefix(trimmed, "/subagent ") ||
+		trimmed == "/subagent" ||
+		strings.HasPrefix(trimmed, "/undo") ||
+		strings.HasPrefix(trimmed, "/redo")
 }
 
 // handleBuiltinCommand 处理内置斜杠命令
@@ -1040,6 +1062,14 @@ func (c *coordinator) handleBuiltinCommand(ctx context.Context, sessionID string
 		return c.rejectInit()
 	case strings.HasPrefix(trimmed, "/initialize"):
 		return c.runInit(ctx, sessionID)
+	case strings.HasPrefix(trimmed, "/subagents"):
+		return c.listSubagentsCommand()
+	case strings.HasPrefix(trimmed, "/skills"):
+		return c.listSkillsCommand()
+	case strings.HasPrefix(trimmed, "/rules"):
+		return c.listRulesCommand()
+	case strings.HasPrefix(trimmed, "/subagent"):
+		return c.runSubagentCommand(ctx, sessionID, trimmed)
 	case strings.HasPrefix(trimmed, "/undo"):
 		return c.undoCommand(ctx, sessionID)
 	case strings.HasPrefix(trimmed, "/redo"):
@@ -1047,6 +1077,230 @@ func (c *coordinator) handleBuiltinCommand(ctx context.Context, sessionID string
 	default:
 		return nil, false
 	}
+}
+
+func (c *coordinator) listSubagentsCommand() (*AgentResult, bool) {
+	c.mu.RLock()
+	runner := c.subagents
+	c.mu.RUnlock()
+	if runner == nil {
+		return &AgentResult{Response: "Subagent 尚未初始化。"}, true
+	}
+	items := runner.List()
+	if len(items) == 0 {
+		return &AgentResult{Response: "当前没有加载任何 Subagent。"}, true
+	}
+	var b strings.Builder
+	b.WriteString("已加载 Subagent：\n")
+	for _, item := range items {
+		if item.Description == "" {
+			b.WriteString(fmt.Sprintf("- `%s`\n", item.Name))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("- `%s`：%s\n", item.Name, item.Description))
+	}
+	return &AgentResult{Response: strings.TrimSpace(b.String())}, true
+}
+
+func (c *coordinator) listSkillsCommand() (*AgentResult, bool) {
+	if c.skills == nil {
+		return &AgentResult{Response: "Skills 尚未初始化。"}, true
+	}
+	items := c.skills.List()
+	if len(items) == 0 {
+		return &AgentResult{Response: "当前没有加载任何 Skill。"}, true
+	}
+	var b strings.Builder
+	b.WriteString("已加载 Skills：\n")
+	for _, item := range items {
+		if item.Description == "" {
+			b.WriteString(fmt.Sprintf("- `/%s`\n", item.Name))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("- `/%s`：%s\n", item.Name, item.Description))
+	}
+	return &AgentResult{Response: strings.TrimSpace(b.String())}, true
+}
+
+func (c *coordinator) listRulesCommand() (*AgentResult, bool) {
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		projectRoot = "."
+	}
+	if c.rulesLoader == nil {
+		c.rulesLoader = rules.NewLoader(projectRoot)
+	}
+	c.rulesLoader.SetWorkingDir(projectRoot)
+	set, err := c.rulesLoader.LoadRules()
+	if err != nil {
+		return &AgentResult{Response: fmt.Sprintf("Rules 加载失败: %v", err)}, true
+	}
+	var b strings.Builder
+	b.WriteString("已加载 Rules：\n")
+	appendRules := func(title string, count int) {
+		b.WriteString(fmt.Sprintf("- %s：%d 条\n", title, count))
+	}
+	appendRules("constitution", len(set.Constitution))
+	appendRules("workflow", len(set.Workflow))
+	appendRules("coding", len(set.Coding))
+	return &AgentResult{Response: strings.TrimSpace(b.String())}, true
+}
+
+func (c *coordinator) runSubagentCommand(ctx context.Context, sessionID string, input string) (*AgentResult, bool) {
+	parts := strings.Fields(input)
+	if len(parts) < 3 {
+		return &AgentResult{Response: "用法：`/subagent <name> <task>`。可先输入 `/subagents` 查看可用 Subagent。"}, true
+	}
+	c.mu.RLock()
+	runner := c.subagents
+	c.mu.RUnlock()
+	if runner == nil {
+		return &AgentResult{Response: "Subagent 尚未初始化。"}, true
+	}
+	actualID := sessionID
+	if mappedID, ok := c.sessionIDs[sessionID]; ok {
+		actualID = mappedID
+	}
+	session, err := c.sessions.Get(ctx, actualID)
+	if err != nil {
+		session, err = c.sessions.Create(ctx, "New Session")
+		if err != nil {
+			return &AgentResult{Response: fmt.Sprintf("创建会话失败: %v", err)}, true
+		}
+		c.mu.Lock()
+		c.sessionIDs[sessionID] = session.ID
+		c.mu.Unlock()
+	}
+	name := parts[1]
+	task := normalizeSubagentTaskPath(strings.TrimSpace(strings.TrimPrefix(input, strings.Join(parts[:2], " "))))
+
+	c.publishSubagentRoleSwitch(ctx, session.ID, name)
+	defer c.publishSubagentRoleRestore(context.Background(), session.ID, name)
+
+	result, err := runner.Execute(ctx, name, session, task)
+	if err != nil {
+		errorText := fmt.Sprintf("Subagent 执行失败: %v", err)
+		c.publishSubagentTaskComplete(ctx, session.ID, name, "", errorText)
+		return &AgentResult{Response: errorText}, true
+	}
+	c.publishSubagentTaskComplete(ctx, session.ID, name, result, "")
+	c.persistSubagentExchange(ctx, session.ID, input, name, result)
+	return &AgentResult{Response: result}, true
+}
+
+func (c *coordinator) publishSubagentRoleSwitch(ctx context.Context, parentSessionID, name string) {
+	if c.broker == nil {
+		return
+	}
+	c.broker.PublishMustDeliver(ctx, events.SubagentRoleSwitch{
+		ParentSessionID: parentSessionID,
+		SubagentName:    name,
+		Time:            time.Now(),
+	})
+}
+
+func (c *coordinator) publishSubagentRoleRestore(ctx context.Context, parentSessionID, name string) {
+	if c.broker == nil {
+		return
+	}
+	c.broker.PublishMustDeliver(ctx, events.SubagentRoleRestore{
+		ParentSessionID: parentSessionID,
+		SubagentName:    name,
+		Time:            time.Now(),
+	})
+}
+
+func (c *coordinator) OnSubagentToolCall(ctx context.Context, parentSessionID, subagentName, callID, toolName string, params json.RawMessage) {
+	if c == nil || c.broker == nil {
+		return
+	}
+	c.broker.PublishMustDeliver(ctx, events.SubagentToolCall{
+		ParentSessionID: parentSessionID,
+		SubagentName:    subagentName,
+		ToolCallID:      callID,
+		ToolName:        toolName,
+		Params:          params,
+		Time:            time.Now(),
+	})
+}
+
+func (c *coordinator) OnSubagentToolResult(ctx context.Context, parentSessionID, subagentName, callID, toolName, result, errorText string) {
+	if c == nil || c.broker == nil {
+		return
+	}
+	c.broker.PublishMustDeliver(ctx, events.SubagentToolResult{
+		ParentSessionID: parentSessionID,
+		SubagentName:    subagentName,
+		ToolCallID:      callID,
+		ToolName:        toolName,
+		Result:          result,
+		Error:           errorText,
+		Time:            time.Now(),
+	})
+}
+
+func (c *coordinator) publishSubagentTaskComplete(ctx context.Context, parentSessionID, name, summary, errorText string) {
+	if c.broker == nil {
+		return
+	}
+	c.broker.PublishMustDeliver(ctx, events.SubagentTaskComplete{
+		ParentSessionID: parentSessionID,
+		SubagentName:    name,
+		Summary:         summary,
+		Error:           errorText,
+		Time:            time.Now(),
+	})
+}
+
+func (c *coordinator) persistSubagentExchange(ctx context.Context, sessionID, input, name, result string) {
+	if c.messages == nil {
+		return
+	}
+	_, _ = c.messages.Create(ctx, sessionID, CreateMessageParams{
+		ID:      generateID(),
+		Role:    RoleUser,
+		Content: input,
+	})
+	_, _ = c.messages.Create(ctx, sessionID, CreateMessageParams{
+		ID:      generateID(),
+		Role:    RoleAssistant,
+		Content: fmt.Sprintf("Subagent `%s` 结果：\n\n%s", name, result),
+	})
+}
+
+func normalizeSubagentTaskPath(task string) string {
+	if task == "" {
+		return task
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return task
+	}
+	base := filepath.Base(wd)
+	parts := strings.Fields(task)
+	changed := false
+	for i, part := range parts {
+		if !strings.Contains(part, string(filepath.Separator)) || filepath.IsAbs(part) {
+			continue
+		}
+		clean := filepath.Clean(part)
+		segments := strings.Split(clean, string(filepath.Separator))
+		for idx, segment := range segments {
+			if segment != base || idx == len(segments)-1 {
+				continue
+			}
+			candidate := filepath.Join(segments[idx+1:]...)
+			if _, err := os.Stat(filepath.Join(wd, candidate)); err == nil {
+				parts[i] = candidate
+				changed = true
+			}
+			break
+		}
+	}
+	if !changed {
+		return task
+	}
+	return strings.Join(parts, " ")
 }
 
 // runInit 执行 /initialize 命令，生成 AGENTS.md 内容
