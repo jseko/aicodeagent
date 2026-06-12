@@ -29,7 +29,7 @@ type JSONRPCError struct {
 type ProtocolHandler struct {
 	transport Transport
 	nextID    atomic.Int32
-	pending   sync.Map   // map[int]chan *JSONRPCMessage
+	pending   sync.Map // map[int]chan *JSONRPCMessage
 	onNotify  func(method string, params json.RawMessage)
 }
 
@@ -144,12 +144,13 @@ func (p *ProtocolHandler) receiveLoop(ctx context.Context) {
 			continue
 		}
 
-		// 路由：有 ID → 响应，无 ID → 通知
-		if msg.ID != nil {
-			if ch, ok := p.pending.Load(*msg.ID); ok {
+		if id, ok := responseID(data); ok {
+			if ch, ok := p.pending.Load(id); ok {
 				ch.(chan *JSONRPCMessage) <- &msg
+			} else if p.onNotify != nil {
+				p.onNotify(msg.Method, msg.Params)
 			} else {
-				log.Printf("[MCP Protocol] 未找到对应请求 ID=%d", *msg.ID)
+				log.Printf("[MCP Protocol] 未找到对应请求 ID=%d", id)
 			}
 		} else if p.onNotify != nil {
 			p.onNotify(msg.Method, msg.Params)
@@ -162,4 +163,30 @@ func bytesTrimRight(data []byte) []byte {
 		data = data[:len(data)-1]
 	}
 	return data
+}
+
+// responseID 从 JSON-RPC 原始消息中解析 ID，兼容 LSP 的字符串 ID 和 MCP 的整数 ID。
+// 本方法不依赖 JSONRPCMessage.ID 字段，可接受服务端返回的任意类型 ID。
+
+func responseID(data []byte) (int, bool) {
+	var raw struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return 0, false
+	}
+	if len(raw.ID) == 0 {
+		return 0, false
+	}
+	var intID int
+	if err := json.Unmarshal(raw.ID, &intID); err == nil {
+		return intID, true
+	}
+	var strID string
+	if err := json.Unmarshal(raw.ID, &strID); err == nil {
+		if n, err := fmt.Sscanf(strID, "%d", &intID); err == nil && n == 1 {
+			return intID, true
+		}
+	}
+	return 0, false
 }

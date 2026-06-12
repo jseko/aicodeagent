@@ -18,7 +18,8 @@ providers:
   - type: openai
     name: deepseek
     base_url: https://api.deepseek.com/v1
-    api_key: DEEPSEEK_API_KEY
+    api_key: ${DEEPSEEK_API_KEY}
+api_key: DEEPSEEK_API_KEY
 
 models:
   default: deepseek-chat
@@ -68,6 +69,16 @@ permission:
     - "cat"
 
 summary_prompt: "请用简洁的语言总结以下对话的关键要点，保留所有技术细节。"
+
+# LSP 服务器配置：为 AI 提供代码诊断反馈
+lsp:
+  gopls:
+    command: gopls
+    args: ["serve"]
+    file_types: [".go"]
+    root_markers: ["go.mod"]
+    max_concurrent_requests: 10
+    disabled: false
 
 # MCP 服务器配置：连接外部工具生态
 # type: http 表示 Streamable HTTP；type: sse 表示旧版 HTTP+SSE

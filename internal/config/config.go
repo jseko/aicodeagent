@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,6 +23,8 @@ type Config struct {
 	SummaryPrompt string               `yaml:"summary_prompt"`
 	MCP           map[string]MCPConfig `yaml:"mcp"`
 	Subagents     SubagentsConfig      `yaml:"subagents"`
+LSP           map[string]LSPConfig `yaml:"lsp"`
+
 }
 
 type OpenAI struct {
@@ -104,12 +107,32 @@ type MCPConfig struct {
 type SubagentsConfig struct {
 	Enabled        bool `yaml:"enabled"`
 	AgenticEnabled bool `yaml:"agentic_enabled"`
+	}
+
+type LSPConfig struct {
+	Command               string            `yaml:"command"`
+	Args                  []string          `yaml:"args"`
+	FileTypes             []string          `yaml:"file_types"`
+	RootMarkers           []string          `yaml:"root_markers"`
+	Disabled              bool              `yaml:"disabled"`
+	Env                   map[string]string `yaml:"env"`
+	MaxConcurrentRequests int               `yaml:"max_concurrent_requests"`
+
 }
 
 func (c *Config) ResolveSecret(secretRef string) string {
 	if secretRef == "" {
 		return ""
 	}
+	// 解析 ${VAR} 语法：去掉 ${ 和 } 后从环境变量取值
+	if strings.HasPrefix(secretRef, "${") && strings.HasSuffix(secretRef, "}") {
+		varName := secretRef[2 : len(secretRef)-1]
+		if key := os.Getenv(varName); key != "" {
+			return key
+		}
+		return secretRef
+	}
+	// 兜底：直接作为环境变量名查找
 	if key := os.Getenv(secretRef); key != "" {
 		return key
 	}
@@ -167,6 +190,10 @@ func Load(path string) (*Config, error) {
 	// 3. 环境变量覆盖敏感字段
 	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 		cfg.OpenAI.Key = key
+	}
+	// 解析 Provider API Key 中的环境变量引用（如 ${DEEPSEEK_API_KEY}）
+	for i := range cfg.Providers {
+		cfg.Providers[i].APIKey = cfg.ResolveSecret(cfg.Providers[i].APIKey)
 	}
 
 	return cfg, cfg.Validate()
