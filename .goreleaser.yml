@@ -73,3 +73,19 @@ nfpms:
         dst: /usr/share/zsh/site-functions/_aicodeagent
       - src: completions/aicodeagent.fish
         dst: /usr/share/fish/completions/aicodeagent.fish
+
+brews:
+  - repository:
+      owner: jseko
+      name: homebrew-tap
+    homepage: "https://github.com/jseko/aicodeagent"
+    description: "Terminal-native AI coding agent built with Go"
+    license: MIT
+    install: |
+      bin.install "aicodeagent"
+    post_install: |
+      bash_completion.install "aicodeagent.bash"
+      zsh_completion.install "aicodeagent.zsh"
+      fish_completion.install "aicodeagent.fish"
+    test: |
+      system "#{bin}/aicodeagent --version"
