@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
+	"AICodeAgent/internal/hooks"
 	"AICodeAgent/internal/permission"
 )
 
@@ -193,4 +195,132 @@ func TestToolCallerBlocksHardcodedSecretBeforeExecute(t *testing.T) {
 	if result.Success || executed {
 		t.Fatalf("expected hardcoded secret to be blocked before execution, result=%+v executed=%v", result, executed)
 	}
+}
+
+func TestToolCallerBeforeHookBlocksExecution(t *testing.T) {
+	r := NewRegistry()
+	executed := false
+	r.Register(&mockTool{name: "view", execute: func(ctx context.Context, params json.RawMessage) (Result, error) {
+		executed = true
+		return Result{Success: true, Output: "ok"}, nil
+	}})
+	ps := permission.NewPermissionService(permission.PermLevelNormal, nil, nil)
+	ps.AddWhitelist("/test")
+	caller := NewToolCaller(r, ps)
+	manager := hooks.NewManager()
+	manager.Register(&toolIOHook{name: "block", priority: hooks.PriorityBlocker, err: errors.New("blocked by hook")})
+	caller.SetHookManager(manager)
+
+	result, err := caller.CallTool(context.Background(), "s1", "view", json.RawMessage(`{"file_path":"/test/file.txt"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || executed {
+		t.Fatalf("expected hook to block execution, result=%+v executed=%v", result, executed)
+	}
+}
+
+func TestToolCallerBeforeHookModifiesArgs(t *testing.T) {
+	r := NewRegistry()
+	var got ViewParams
+	r.Register(&mockTool{name: "view", execute: func(ctx context.Context, params json.RawMessage) (Result, error) {
+		if err := json.Unmarshal(params, &got); err != nil {
+			return Result{Success: false, Error: err.Error()}, nil
+		}
+		return Result{Success: true, Output: "ok"}, nil
+	}})
+	ps := permission.NewPermissionService(permission.PermLevelNormal, nil, nil)
+	ps.AddWhitelist("/test")
+	ps.AddWhitelist("/safe")
+	caller := NewToolCaller(r, ps)
+	manager := hooks.NewManager()
+	manager.Register(&toolIOHook{name: "rewrite", priority: hooks.PriorityNormal, update: json.RawMessage(`{"file_path":"/safe/file.txt"}`)})
+	caller.SetHookManager(manager)
+
+	result, err := caller.CallTool(context.Background(), "s1", "view", json.RawMessage(`{"file_path":"/test/file.txt"}`))
+	if err != nil || !result.Success {
+		t.Fatalf("unexpected result=%+v err=%v", result, err)
+	}
+	if got.FilePath != "/safe/file.txt" {
+		t.Fatalf("hook-modified args not used: %+v", got)
+	}
+}
+
+func TestToolCallerAfterHookObservesResult(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&mockTool{name: "view", execute: func(ctx context.Context, params json.RawMessage) (Result, error) {
+		return Result{Success: true, Output: "ok"}, nil
+	}})
+	ps := permission.NewPermissionService(permission.PermLevelNormal, nil, nil)
+	ps.AddWhitelist("/test")
+	caller := NewToolCaller(r, ps)
+	manager := hooks.NewManager()
+	after := &toolEventHook{name: "after", types: []hooks.EventType{hooks.EventToolExecuteAfter}}
+	manager.Register(after)
+	caller.SetHookManager(manager)
+
+	result, err := caller.CallTool(context.Background(), "s1", "view", json.RawMessage(`{"file_path":"/test/file.txt"}`))
+	if err != nil || !result.Success {
+		t.Fatalf("unexpected result=%+v err=%v", result, err)
+	}
+	if after.calls != 1 {
+		t.Fatalf("after hook should observe once, got %d", after.calls)
+	}
+}
+
+func TestToolCallerPermissionFailureBeforeHook(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&mockTool{name: "view", execute: func(ctx context.Context, params json.RawMessage) (Result, error) {
+		return Result{Success: true, Output: "ok"}, nil
+	}})
+	ps := permission.NewPermissionService(permission.PermLevelGuest, nil, nil)
+	caller := NewToolCaller(r, ps)
+	manager := hooks.NewManager()
+	before := &toolIOHook{name: "before", priority: hooks.PriorityNormal}
+	manager.Register(before)
+	caller.SetHookManager(manager)
+
+	result, err := caller.CallTool(context.Background(), "s1", "view", json.RawMessage(`{"file_path":"/blocked/file.txt"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || before.calls != 0 {
+		t.Fatalf("permission failure should happen before hook, result=%+v calls=%d", result, before.calls)
+	}
+}
+
+type toolIOHook struct {
+	name     string
+	priority hooks.Priority
+	err      error
+	update   json.RawMessage
+	calls    int
+}
+
+func (h *toolIOHook) Name() string            { return h.name }
+func (h *toolIOHook) Types() []hooks.EventType { return []hooks.EventType{hooks.EventToolExecuteBefore} }
+func (h *toolIOHook) Priority() hooks.Priority { return h.priority }
+func (h *toolIOHook) Execute(ctx context.Context, input interface{}, output interface{}) error {
+	h.calls++
+	if h.err != nil {
+		return h.err
+	}
+	if len(h.update) > 0 {
+		output.(*hooks.ToolExecuteOutput).Args = h.update
+	}
+	return nil
+}
+
+type toolEventHook struct {
+	name  string
+	types []hooks.EventType
+	calls int
+}
+
+func (h *toolEventHook) Name() string            { return h.name }
+func (h *toolEventHook) Types() []hooks.EventType { return h.types }
+func (h *toolEventHook) Priority() hooks.Priority { return hooks.PriorityObserver }
+func (h *toolEventHook) OnEvent(ctx context.Context, event interface{}) error {
+	h.calls++
+	return nil
 }

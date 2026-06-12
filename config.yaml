@@ -100,3 +100,13 @@ mcp:
 #     timeout: 30
 #     headers:
 #       Authorization: "Bearer ${MCP_TOKEN}"
+
+# Hooks 系统配置：可插拔的工具执行扩展
+# enabled: true 时，Coordinator 初始化时自动加载 HookManager
+# files: 引用外部 YAML 文件注册的 Hook
+# hooks: 内联定义的外部 Hook（与 files 中的合并）
+hooks:
+  enabled: true
+  files:
+    - ".aicode/hooks/env-protection.yaml"
+    - ".aicode/hooks/audit.yaml"

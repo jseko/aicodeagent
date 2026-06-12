@@ -17,6 +17,7 @@ import (
 	"AICodeAgent/internal/agent/tools"
 	"AICodeAgent/internal/config"
 	"AICodeAgent/internal/events"
+	"AICodeAgent/internal/hooks"
 	"AICodeAgent/internal/llm"
 	"AICodeAgent/internal/permission"
 	"AICodeAgent/internal/pubsub"
@@ -144,6 +145,19 @@ func NewCoordinator(cfg *config.Config, sessions SessionService, messages Messag
 		sessionIDs:  make(map[string]string),
 	}
 	c.toolCaller = tools.NewToolCaller(toolRegistry, permService)
+	if cfg.Hooks.Enabled {
+		hookMgr := hooks.NewManager()
+		bridge := hooks.NewBridge(hookMgr, hooks.NewExecutor())
+		if err := bridge.LoadAndRegister(cfg.Hooks.Hooks); err != nil {
+			log.Printf("[Coordinator] 加载外部 hooks 失败: %v", err)
+		}
+		if len(cfg.Hooks.Files) > 0 {
+			if err := bridge.LoadFilesAndRegister(cfg.Hooks.Files); err != nil {
+				log.Printf("[Coordinator] 加载 hooks 配置文件失败: %v", err)
+			}
+		}
+		c.toolCaller.SetHookManager(hookMgr)
+	}
 	c.confirmFn = c.requestUserConfirmation
 	c.pendingConfs = make(map[string]chan bool)
 	if sub, ok := broker.(pubsub.Subscriber[events.Event]); ok {

@@ -408,6 +408,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if msg.String() == "alt+c" {
+			text := m.lastAssistantText()
+			if text != "" {
+				m.statusMsg = "已复制最后一条 AI 回复"
+				return m, copySelectedText(text)
+			}
+			return m, nil
+		}
 
 		if m.pendingConfirm != nil {
 			return m.handlePermissionKey(msg)
@@ -875,9 +883,9 @@ func (m Model) View() string {
 	}
 
 	if messageView.content != "" {
-		b.WriteString(messageView.content)
-		b.WriteString("\n")
-	}
+			b.WriteString(messageView.content)
+			b.WriteString("\n")
+		}
 
 	if m.pendingConfirm != nil {
 		confirmStyle := lipgloss.NewStyle().
@@ -1063,7 +1071,7 @@ func Start(a *app.App) error {
 	}
 
 	ui := NewUI(a)
-	p := tea.NewProgram(ui, tea.WithMouseCellMotion())
+	p := tea.NewProgram(ui)
 
 	ctx, cancel := context.WithCancel(a.Ctx)
 	defer cancel()
@@ -1077,6 +1085,16 @@ func Start(a *app.App) error {
 }
 
 // spinnerTick 50ms 刷新定时器（20fps，例9-5）
+// lastAssistantText 返回最后一条 AI 助手的消息文本
+func (m *Model) lastAssistantText() string {
+	for i := len(m.messageItems) - 1; i >= 0; i-- {
+		if a, ok := m.messageItems[i].(*AssistantMessageItem); ok && a.message.Content != "" {
+			return a.message.Content
+		}
+	}
+	return ""
+}
+
 func spinnerTick() tea.Cmd {
 	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
 		return SpinnerTickMsg{}

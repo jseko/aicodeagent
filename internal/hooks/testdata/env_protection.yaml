@@ -1,0 +1,8 @@
+hooks:
+  - name: env-protection
+    types: [tool.execute.before]
+    command: python3
+    args: ["testdata/env_protection.py"]
+    matcher: '^(write_file|view)$'
+    priority: 100
+    timeout: 5s

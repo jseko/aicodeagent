@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -96,7 +97,7 @@ func (vl *ValidationLoop) ValidateAndRepairWithFallback(ctx context.Context, ses
 		if vl.coordinator == nil {
 			result.Status = ValidationStatusFailed
 			result.FinalError = "coordinator is nil"
-			return result, fmt.Errorf(result.FinalError)
+			return result, errors.New(result.FinalError)
 		}
 
 		agentResult, err := vl.coordinator.Run(ctx, sessionID, repairPrompt)
@@ -111,7 +112,7 @@ func (vl *ValidationLoop) ValidateAndRepairWithFallback(ctx context.Context, ses
 	_ = os.WriteFile(filePath, []byte(result.BestCode), 0644)
 	result.Status = ValidationStatusMaxIterations
 	result.FinalError = fmt.Sprintf("reached max iterations (%d)", vl.maxIterations)
-	return result, fmt.Errorf(result.FinalError)
+	return result, errors.New(result.FinalError)
 }
 
 func (vl *ValidationLoop) ValidateAndRepair(ctx context.Context, sessionID, filePath, generatedCode string) (*ValidationResult, error) {

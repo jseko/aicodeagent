@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"AICodeAgent/internal/hooks"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,6 +23,7 @@ type Config struct {
 	Permission    PermissionConfig     `yaml:"permission"`
 	SummaryPrompt string               `yaml:"summary_prompt"`
 	MCP           map[string]MCPConfig `yaml:"mcp"`
+	Hooks         hooks.Config         `yaml:"hooks"`
 	Subagents     SubagentsConfig      `yaml:"subagents"`
 LSP           map[string]LSPConfig `yaml:"lsp"`
 
@@ -206,6 +208,11 @@ func (c *Config) Validate() error {
 	}
 	if c.LogLevel == "" {
 		return fmt.Errorf("配置校验失败: log_level 不能为空")
+	}
+	if c.Hooks.Enabled {
+		if _, err := hooks.ValidateExternalHooks(c.Hooks.Hooks); err != nil {
+			return fmt.Errorf("hooks 配置校验失败: %w", err)
+		}
 	}
 	return nil
 }
