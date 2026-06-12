@@ -110,3 +110,8 @@ hooks:
   files:
     - ".aicode/hooks/env-protection.yaml"
     - ".aicode/hooks/audit.yaml"
+    # === 测试场景 Hook（取消注释即可测试） ===
+    # - ".aicode/hooks/test/sleep-blocker.yaml"    # 场景5：超时处理
+    # - ".aicode/hooks/test/halt-blocker.yaml"    # 场景6：Halt 退出码 49
+    # - ".aicode/hooks/test/param-rewriter.yaml"  # 场景8：参数改写
+    # - ".aicode/hooks/test/malformed-json.yaml"  # 场景9：畸形 JSON 响应
