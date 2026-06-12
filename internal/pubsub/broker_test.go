@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
 
 func TestNewBroker(t *testing.T) {
@@ -252,4 +254,56 @@ drain:
 	if count == 0 {
 		t.Error("no messages received after concurrent publishes")
 	}
+}
+
+func TestSlowConsumer(t *testing.T) {
+	b := NewBrokerWithOptions[int](4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := b.Subscribe(ctx)
+
+	// Publish faster than consumer reads
+	for i := 0; i < 20; i++ {
+		b.Publish(i)
+	}
+
+	// Consumer reads slowly
+	count := 0
+	timeout := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case <-ch:
+			count++
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	if count == 0 {
+		t.Error("slow consumer should receive at least some messages")
+	}
+	// With buffer size 4 and 20 publishes, some should have been dropped
+	if b.DropCount() == 0 {
+		t.Error("expected drops with slow consumer and small buffer")
+	}
+}
+
+func TestGoroutineLeak(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	b := NewBroker[string]()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ch := b.Subscribe(ctx)
+	b.Publish("test")
+
+	select {
+	case <-ch:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout")
+	}
+
+	cancel()
+	time.Sleep(50 * time.Millisecond)
 }

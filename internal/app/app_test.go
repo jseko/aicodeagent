@@ -8,7 +8,180 @@ import (
 
 	"AICodeAgent/internal/events"
 	"AICodeAgent/internal/pubsub"
+
+	"go.uber.org/goleak"
 )
+
+// subscriberFixture 订阅者测试夹具，封装测试环境
+type subscriberFixture struct {
+	broker   *pubsub.Broker[events.Event]
+	ctx      context.Context
+	cancel   context.CancelFunc
+	ch       <-chan events.Event
+	received []events.Event
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+}
+
+// newSubscriberFixture 创建测试夹具并注册清理函数
+func newSubscriberFixture(t *testing.T) *subscriberFixture {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	broker := pubsub.NewBroker[events.Event]()
+	ch := broker.Subscribe(ctx)
+
+	f := &subscriberFixture{
+		broker: broker,
+		ctx:    ctx,
+		cancel: cancel,
+		ch:     ch,
+	}
+
+	// 启动后台收集器
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-ch:
+				if !ok {
+					return
+				}
+				f.mu.Lock()
+				f.received = append(f.received, evt)
+				f.mu.Unlock()
+			}
+		}
+	}()
+
+	t.Cleanup(func() {
+		f.cancel()
+		f.wg.Wait()
+	})
+
+	return f
+}
+
+func (f *subscriberFixture) receivedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.received)
+}
+
+// TestSetupSubscriber_NormalFlow 验证正常流程：发布事件 → 订阅者接收
+func TestSetupSubscriber_NormalFlow(t *testing.T) {
+	f := newSubscriberFixture(t)
+
+	// 发布 5 个流式 chunk + 1 个 IsDone 事件
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		f.broker.PublishMustDeliver(f.ctx,
+			events.AgentThink{SessionID: "s1", Content: "chunk", Time: now})
+	}
+	f.broker.PublishMustDeliver(f.ctx,
+		events.AgentThink{SessionID: "s1", IsDone: true, Time: now})
+
+	time.Sleep(100 * time.Millisecond)
+
+	count := f.receivedCount()
+	if count < 5 {
+		t.Errorf("expected at least 5 events, got %d", count)
+	}
+
+	// 验证 IsDone 存在
+	f.mu.Lock()
+	hasIsDone := false
+	for _, evt := range f.received {
+		if think, ok := evt.(events.AgentThink); ok && think.IsDone {
+			hasIsDone = true
+			break
+		}
+	}
+	f.mu.Unlock()
+
+	if !hasIsDone {
+		t.Error("expected AgentThink with IsDone=true")
+	}
+}
+
+// TestSetupSubscriber_SlowConsumer 验证慢消费者消息丢弃行为
+func TestSetupSubscriber_SlowConsumer(t *testing.T) {
+	// 使用小缓冲区强制丢弃
+	broker := pubsub.NewBrokerWithOptions[events.Event](2)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ch := broker.Subscribe(ctx)
+
+	// 快速发布，缓冲区满后丢弃
+	now := time.Now()
+	for i := 0; i < 50; i++ {
+		broker.Publish(events.AgentThink{SessionID: "s1", Content: "data", Time: now})
+	}
+
+	// 慢速消费
+	count := 0
+	timeout := time.After(300 * time.Millisecond)
+drain:
+	for {
+		select {
+		case <-ch:
+			count++
+		case <-timeout:
+			break drain
+		}
+	}
+
+	if count == 0 {
+		t.Error("slow consumer should receive at least some messages")
+	}
+	if broker.DropCount() == 0 {
+		t.Error("expected drops with small buffer and fast publisher")
+	}
+}
+
+// TestSetupSubscriber_NoTimerLeak 验证测试结束后无 goroutine 泄漏
+func TestSetupSubscriber_NoTimerLeak(t *testing.T) {
+	broker := pubsub.NewBroker[events.Event]()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	ch := broker.Subscribe(ctx)
+
+	// 收集 goroutine
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+
+	now := time.Now()
+	broker.PublishMustDeliver(ctx,
+		events.UserMessage{SessionID: "s1", Content: "hello", Time: now})
+	broker.PublishMustDeliver(ctx,
+		events.AgentThink{SessionID: "s1", IsDone: true, Time: now})
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 先手动清理，再检查 goroutine 泄漏
+	cancel()
+	wg.Wait()
+	broker.Shutdown()
+
+	goleak.VerifyNone(t)
+}
 
 // TestEventPipeline 端到端集成测试：模拟 UserMessage → Coordinator → TUI 完整事件流
 func TestEventPipeline(t *testing.T) {

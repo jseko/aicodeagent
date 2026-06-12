@@ -1,0 +1,30 @@
+# VCR Test Data — Read File Scenario
+# Recorded from openai/gpt-4o on 2026-06-12
+# Re-record: go test -v -count=1 ./internal/agent -update-vcr
+
+scenario: read_file
+provider: openai
+model: gpt-4o
+timestamp: "2026-06-12T20:00:00Z"
+
+request:
+  messages:
+    - role: system
+      content: "You are an AI coding agent."
+    - role: user
+      content: "Read the file main.go"
+  tools:
+    - name: view
+      description: "Read file contents"
+
+response:
+  choices:
+    - message:
+        role: assistant
+        content: null
+        tool_calls:
+          - id: call_1
+            type: function
+            function:
+              name: view
+              arguments: '{"file_path":"main.go"}'

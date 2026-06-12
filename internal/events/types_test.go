@@ -172,3 +172,104 @@ func TestEventTypeConstants(t *testing.T) {
 		t.Errorf("TypeError = %s", TypeError)
 	}
 }
+
+func TestSubagentEvents(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		event    Event
+		wantType EventType
+	}{
+		{
+			"SubagentRoleSwitch",
+			SubagentRoleSwitch{ParentSessionID: "p1", SubagentName: "code-reviewer", ChildSessionID: "c1", Time: now},
+			TypeSubagentRoleSwitch,
+		},
+		{
+			"SubagentRoleRestore",
+			SubagentRoleRestore{ParentSessionID: "p1", SubagentName: "code-reviewer", Time: now},
+			TypeSubagentRoleRestore,
+		},
+		{
+			"SubagentToolCall",
+			SubagentToolCall{ParentSessionID: "p1", SubagentName: "explore", ToolCallID: "tc1", ToolName: "read_file", Time: now},
+			TypeSubagentToolCall,
+		},
+		{
+			"SubagentToolResult",
+			SubagentToolResult{ParentSessionID: "p1", SubagentName: "explore", ToolCallID: "tc1", ToolName: "read_file", Result: "ok", Time: now},
+			TypeSubagentToolResult,
+		},
+		{
+			"SubagentTaskComplete",
+			SubagentTaskComplete{ParentSessionID: "p1", SubagentName: "code-reviewer", Summary: "done", Time: now},
+			TypeSubagentTaskComplete,
+		},
+		{
+			"SessionUpdate",
+			SessionUpdate{SessionID: "s1", PromptTokens: 1000, Time: now},
+			TypeSessionUpdate,
+		},
+		{
+			"CancelTask",
+			CancelTask{SessionID: "s1", Time: now},
+			TypeCancelTask,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.event.Type() != tt.wantType {
+				t.Errorf("Type() = %s, want %s", tt.event.Type(), tt.wantType)
+			}
+			if !tt.event.Timestamp().Equal(now) {
+				t.Errorf("Timestamp() = %v, want %v", tt.event.Timestamp(), now)
+			}
+		})
+	}
+}
+
+func TestSubagentEventsJSON(t *testing.T) {
+	now := time.Now()
+
+	t.Run("SubagentRoleSwitch", func(t *testing.T) {
+		evt := SubagentRoleSwitch{
+			ParentSessionID: "parent_1",
+			SubagentName:    "code-reviewer",
+			ChildSessionID:  "child_1",
+			Time:            now,
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded SubagentRoleSwitch
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.SubagentName != "code-reviewer" {
+			t.Errorf("SubagentName = %s", decoded.SubagentName)
+		}
+	})
+
+	t.Run("SubagentTaskComplete", func(t *testing.T) {
+		evt := SubagentTaskComplete{
+			ParentSessionID: "parent_1",
+			SubagentName:    "explore",
+			Summary:         "found 3 files",
+			Time:            now,
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded SubagentTaskComplete
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.Summary != "found 3 files" {
+			t.Errorf("Summary = %s", decoded.Summary)
+		}
+	})
+}

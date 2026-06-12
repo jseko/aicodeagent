@@ -7,3 +7,7 @@ aicodeagent.log
 .serena/
 .aicode/
 AGENTS.md
+dist/
+completions/
+coverage.out
+.DS_Store
