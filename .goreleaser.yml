@@ -75,8 +75,7 @@ nfpms:
         dst: /usr/share/fish/completions/aicodeagent.fish
 
 brews:
-  - token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    repository:
+  - repository:
       owner: jseko
       name: homebrew-tap
     homepage: "https://github.com/jseko/aicodeagent"
