@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"AICodeAgent/internal/hooks"
@@ -141,10 +142,43 @@ func (c *Config) ResolveSecret(secretRef string) string {
 	return secretRef
 }
 
-// Load 加载配置：默认 → 文件 → 环境变量
+// getConfigPaths 返回按优先级递增排序的配置文件路径列表
+// 加载顺序：默认值 → ./config.yaml → ~/.aicode/config.yaml
+// 后加载的会覆盖先加载的，所以 ~/.aicode/config.yaml 优先级最高
+func getConfigPaths() []string {
+	var paths []string
+
+	// 工作目录下的项目级配置
+	paths = append(paths, "config.yaml")
+
+	// 用户级全局配置，优先级最高
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".aicode", "config.yaml"))
+	}
+
+	return paths
+}
+
+// Load 加载配置：默认 → 工作目录 → ~/.aicode/config.yaml（最高优先级） → 环境变量
 func Load(path string) (*Config, error) {
-	// 1. 初始化默认配置
-	cfg := &Config{
+	cfg := defaultConfig()
+
+	if path != "" && path != "config.yaml" {
+		// 显式指定非默认路径时，仅加载该文件
+		loadFile(cfg, path)
+	} else {
+		// 优先级链：./config.yaml → ~/.aicode/config.yaml
+		for _, p := range getConfigPaths() {
+			loadFile(cfg, p)
+		}
+	}
+
+	applyEnvOverrides(cfg)
+	return cfg, cfg.Validate()
+}
+
+func defaultConfig() *Config {
+	return &Config{
 		Theme:    "dark",
 		LogLevel: "info",
 		OpenAI:   OpenAI{Model: "gpt-4o", Temperature: 0.7},
@@ -181,24 +215,25 @@ func Load(path string) (*Config, error) {
 		Permission:    PermissionConfig{DefaultLevel: 1},
 		SummaryPrompt: "请用简洁的语言总结以下对话的关键要点，保留所有技术细节。",
 	}
+}
 
-	// 2. 读取配置文件（如果不存在则使用默认）
-	if data, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			log.Printf("[Config] 配置文件解析失败，使用默认配置: %v", err)
-		}
+func loadFile(cfg *Config, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
 	}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		log.Printf("[Config] 配置文件解析失败 (%s): %v", path, err)
+	}
+}
 
-	// 3. 环境变量覆盖敏感字段
+func applyEnvOverrides(cfg *Config) {
 	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 		cfg.OpenAI.Key = key
 	}
-	// 解析 Provider API Key 中的环境变量引用（如 ${DEEPSEEK_API_KEY}）
 	for i := range cfg.Providers {
 		cfg.Providers[i].APIKey = cfg.ResolveSecret(cfg.Providers[i].APIKey)
 	}
-
-	return cfg, cfg.Validate()
 }
 
 // Validate 校验配置有效性

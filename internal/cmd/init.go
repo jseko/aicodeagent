@@ -27,7 +27,12 @@ func init() {
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
-	configPath := "config.yaml"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("无法获取用户主目录: %w", err)
+	}
+	configDir := filepath.Join(home, ".aicode")
+	configPath := filepath.Join(configDir, "config.yaml")
 
 	// 检测已有配置
 	if _, err := os.Stat(configPath); err == nil {
